@@ -4,13 +4,13 @@ Native C++/ImGui in-game overlay and modding tools for Batman: Arkham Knight. Th
 
 ## Current development snapshot
 
-The current source and packaged DLL are **v5.72**. The Pose tab and its Rocksteady runtime tracing are experimental; pose editing and animation freeze still require in-game validation.
+The current source and packaged DLL are **v5.72**. This and every version newer than v5.27 is **work in progress (WIP)**. Pose tooling and Rocksteady runtime tracing are experimental; pose editing and animation freeze still require in-game validation. Do not treat v5.28+ as a stable live-light release.
 
-## Live light editing
+## Live Spot lights
 
-**Latest release whose notes explicitly carry forward live light editing: v5.27.** The runtime-tested baseline is **v5.25**: during a Steam session, Point/Spot actor movement updated the light matrices and the user confirmed live light and gizmo movement. The v5.26 notes say live editing from v5.25 is preserved; v5.27 preserves the v5.26 world-gizmo fix. See [`releases/v5.25/README.txt`](releases/v5.25/README.txt), [`releases/v5.26/README.txt`](releases/v5.26/README.txt), and [`releases/v5.27/README.txt`](releases/v5.27/README.txt).
+**Use v5.27 as the latest documented version for live Spot lights.** The direct in-game confirmation is from **v5.25** on Steam: Spot/Point actor movement updated the light matrices, and the user confirmed the live light and gizmo moved. The v5.26 notes explicitly preserve v5.25 live editing; v5.27 preserves the v5.26 world-gizmo fix. See [`releases/v5.25/README.txt`](releases/v5.25/README.txt), [`releases/v5.26/README.txt`](releases/v5.26/README.txt), and [`releases/v5.27/README.txt`](releases/v5.27/README.txt).
 
-Later versions focus on other features, especially Pose tooling. BatLit remains in the current source, but live light editing has not been revalidated on v5.72. Use the v5.27 package as the latest documented live-light build until a newer runtime test confirms it.
+**v5.28 and all newer versions are WIP.** They focus on Pose tooling. BatLit is still present in the source, but Spot live control has not been revalidated on those versions and is not guaranteed. Use the v5.27 package when you need the documented live Spot behavior.
 
 ## Build
 
