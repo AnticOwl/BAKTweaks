@@ -1,0 +1,42 @@
+BATLIT NATIVE v5.7 - FIRST TEST
+
+No .cs file is required.
+
+1. Build BAKTweaks.dll as usual.
+2. Inject/load only BAKTweaks.dll.
+3. F10 -> BatLit.
+4. Click Create Spot.
+5. Expected row: Spot 1   [Edit]
+6. Edit -> change Color and Intensity -> Apply.
+7. Create Spot 2 and give it different values.
+8. Re-open Spot 1 / Spot 2 and confirm the values remain independent.
+
+If Create Spot does nothing, check BAKTweaks.log for one of:
+  BatLit: native UE3 resolver ready
+  BatLit: EngineTick hook enabled
+or a specific resolver/build failure.
+
+
+v5.8 additional checks
+----------------------
+1. Change resolution while BAK Tweaks is loaded.
+2. Press F10: ImGui cursor must still appear and move normally.
+3. Pause the game.
+4. F10 -> BatLit -> Create Spot.
+5. Spot must be created while still paused.
+6. Edit Color / Intensity while paused and press Apply.
+7. Create a second Spot with different values and verify both remain independent.
+
+Lightning Instances test:
+- Small Instances: 1..32 retriggers, one per engine tick.
+- Vertical Instances: 1..32 retriggers, one per engine tick.
+- Uses the same renderer-registered natural PSC path as the validated single-lightning test.
+- With longer lifetime / slow motion, verify whether successive retriggers remain visible together as intended.
+
+Lightning randomizer test (v5.23)
+- Based on the validated MultiBurst path.
+- Randomize Screen Position: moves the natural registered lightning PSC to a random point inside the current camera frame for each trigger.
+- Horizontal Spread / Vertical Spread are normalized 0..1 screen extents.
+- Distance Variation adds +/- percentage jitter around the selected Small/Vertical Distance.
+- Multi-instance remains the validated ParticleModuleSpawn BurstList method (1..32).
+- No cleanup of historical/diagnostic lightning code yet; cleanup is intentionally deferred until this test is validated in-game.

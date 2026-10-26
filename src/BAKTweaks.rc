@@ -1,0 +1,28 @@
+#include "resource.h"
+#include <winver.h>
+IDR_BAT_BACKGROUND RCDATA "../res/BAKTweaksBackground.jpg"
+
+1 VERSIONINFO
+ FILEVERSION 5,69,0,0
+ PRODUCTVERSION 5,69,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_DLL
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "BAK Tweaks - Live Lights\0"
+            VALUE "FileVersion", "5.69.0.0\0"
+            VALUE "ProductName", "BAK Tweaks\0"
+            VALUE "ProductVersion", "5.69\0"
+            VALUE "OriginalFilename", "BAKTweaks.dll\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

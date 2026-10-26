@@ -1,0 +1,2 @@
+#include "resource.h"
+IDR_BAT_BACKGROUND RCDATA "../res/BatTweaksBackground.jpg"

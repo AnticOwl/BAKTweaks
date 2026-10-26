@@ -1,0 +1,26 @@
+# Generated CMake/Visual Studio build trees at project root
+/build*/
+/.vs/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+build.ninja
+.ninja_*
+**/.ninja_*
+
+# Generated experiment build/link output (keep experiment sources and notes)
+/experiments/**/build/
+/experiments/**/relink/
+/experiments/**/TestWriter.exe
+
+# Compiler/intermediate output
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.map
+
+# Runtime logs and local configuration
+*.log
+BAKTweaks.ini

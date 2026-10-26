@@ -1,0 +1,113 @@
+<?xml version="1.0" ?>
+<CheatTable CheatEngineTableVersion="45">
+  <CheatEntries>
+    <CheatEntry>
+      <ID>1</ID>
+      <Description>"01 - Freeze all bone rotations (experimental)"</Description>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+aobscanmodule(AKFullFreeze,BatmanAK.exe,43 0F 29 34 01 0F 57 D7 43 0F 29 54 01 10)
+registersymbol(AKFullFreeze)
+assert(AKFullFreeze,43 0F 29 34 01)
+AKFullFreeze:
+  db 90 90 90 90 90
+[DISABLE]
+AKFullFreeze:
+  db 43 0F 29 34 01
+unregistersymbol(AKFullFreeze)</AssemblerScript>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>2</ID>
+      <Description>"02 - Freeze Head bone 7 (tested concept)"</Description>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+aobscanmodule(AKHeadSpaceHook,BatmanAK.exe,43 0F 29 34 01 0F 57 D7 43 0F 29 54 01 10)
+alloc(AKHeadCave,1024,AKHeadSpaceHook)
+alloc(AKHeadData,128)
+registersymbol(AKHeadSpaceHook)
+registersymbol(AKHeadData)
+label(return)
+label(normal)
+label(captured)
+AKHeadData:
+dd 0 // +00 freeze
+dd 0 // +04 captured
+dd 0 // +08 head hits
+dd 0 // +0C last bone
+dd (float)0 // +10 qx
+dd (float)0 // +14 qy
+dd (float)0 // +18 qz
+dd (float)1 // +1C qw
+AKHeadCave:
+  push rax
+  mov rax,r9
+  shr rax,5
+  mov [AKHeadData+0C],eax
+  cmp eax,7
+  jne normal
+  inc dword ptr [AKHeadData+08]
+  cmp dword ptr [AKHeadData+04],1
+  je captured
+  movups [AKHeadData+10],xmm6
+  mov dword ptr [AKHeadData+04],1
+captured:
+  cmp dword ptr [AKHeadData+00],1
+  jne normal
+  // Do not overwrite xmm0 or xmm6: they may be live after the hook.
+  // Use a temporary GPR and write four floats as raw DWORDs.
+  push rdx
+  mov edx,[AKHeadData+10]
+  mov [r8+r9],edx
+  mov edx,[AKHeadData+14]
+  mov [r8+r9+04],edx
+  mov edx,[AKHeadData+18]
+  mov [r8+r9+08],edx
+  mov edx,[AKHeadData+1C]
+  mov [r8+r9+0C],edx
+  pop rdx
+  pop rax
+  jmp return
+normal:
+  pop rax
+  movaps [r9+r8],xmm6
+  jmp return
+AKHeadSpaceHook:
+  jmp AKHeadCave
+return:
+{$lua}
+if syntaxcheck then return end
+local al=getAddressList()
+local p=memrec
+local function r(desc,offset,typ)
+ local m=al.createMemoryRecord()
+ m.Description=desc
+ m.Address=string.format('AKHeadData+%02X',offset)
+ m.Type=typ
+ m.appendToEntry(p)
+end
+r('Freeze Head (set 1)',0,vtDword)
+r('Captured',4,vtDword)
+r('Head Hits',8,vtDword)
+r('Last Bone Index',12,vtDword)
+r('Captured QX',16,vtSingle)
+r('Captured QY',20,vtSingle)
+r('Captured QZ',24,vtSingle)
+r('Captured QW',28,vtSingle)
+{$asm}
+[DISABLE]
+AKHeadSpaceHook:
+  db 43 0F 29 34 01
+{$lua}
+if syntaxcheck then return end
+if memrec then
+ for i=memrec.Count-1,0,-1 do memrec.Child[i].destroy() end
+end
+{$asm}
+unregistersymbol(AKHeadSpaceHook)
+unregistersymbol(AKHeadData)
+dealloc(AKHeadData)
+dealloc(AKHeadCave)</AssemblerScript>
+    </CheatEntry>
+  </CheatEntries>
+  <UserdefinedSymbols/>
+</CheatTable>

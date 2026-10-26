@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(BAKEditorTrace LANGUAGES CXX)
+add_subdirectory(../../third_party/minhook minhook)
+add_library(BAKEditorTrace SHARED Trace.cpp)
+target_include_directories(BAKEditorTrace PRIVATE ../../third_party/minhook/include)
+target_compile_features(BAKEditorTrace PRIVATE cxx_std_20)
+target_compile_definitions(BAKEditorTrace PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(BAKEditorTrace PRIVATE minhook)

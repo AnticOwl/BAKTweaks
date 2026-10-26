@@ -1,0 +1,4588 @@
+﻿#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <Xinput.h>
+#include <d3d11.h>
+#include <dxgi.h>
+#include <wincodec.h>
+#include <atomic>
+#include <cstdint>
+#include <vector>
+#include <algorithm>
+#include <cstring>
+#include <string>
+#include <cstdio>
+#include <cwchar>
+#include <mutex>
+#include <cmath>
+#include <array>
+#include <cstddef>
+#include <new>
+
+#include "imgui.h"
+#include "backends/imgui_impl_win32.h"
+#include "backends/imgui_impl_dx11.h"
+#include "MinHook.h"
+#include "resource.h"
+
+static void HelpMarker(const char* desc)
+{
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
+    {
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
+        ImGui::TextUnformatted(desc);
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
+}
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "windowscodecs.lib")
+
+namespace {
+using PresentFn = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT);
+using ResizeBuffersFn = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+
+HMODULE g_module = nullptr;
+std::atomic<bool> g_running{true};
+std::atomic<bool> g_uiOpen{true};
+
+// User-configurable shortcuts.
+// Defaults preserve the current BAK Tweaks mapping.
+int g_hotkeyToggleUI = VK_F10;
+int g_hotkeySmallLightning = VK_F6;
+int g_hotkeyVerticalLightning = VK_F7;
+std::wstring g_configPath;
+
+std::atomic<uintptr_t> g_capeBase{0};
+std::atomic<uintptr_t> g_rainConsole{0};
+std::atomic<uintptr_t> g_rainEngine{0};
+
+// Exposure override (LevelPP only)
+std::atomic<bool> g_exposureWanted{false};
+std::atomic<bool> g_exposureApplied{false};
+std::atomic<float> g_exposureValue{1.0f};
+std::atomic<uintptr_t> g_exposureLocalPlayer{0};
+
+PresentFn g_originalPresent = nullptr;
+ResizeBuffersFn g_originalResizeBuffers = nullptr;
+
+// Hard game-input block while BAK Tweaks is open.
+// WndProc/WM_INPUT blocking handles the normal UE3 path; these API hooks cover
+// polling paths (keyboard/mouse buttons via User32 and controller via XInput).
+using GetAsyncKeyStateFn = SHORT (WINAPI*)(int);
+using GetKeyStateFn = SHORT (WINAPI*)(int);
+using GetKeyboardStateFn = BOOL (WINAPI*)(PBYTE);
+using GetRawInputDataFn = UINT (WINAPI*)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
+using GetRawInputBufferFn = UINT (WINAPI*)(PRAWINPUT, PUINT, UINT);
+using GetCursorPosFn = BOOL (WINAPI*)(LPPOINT);
+using SetCursorPosFn = BOOL (WINAPI*)(int, int);
+using ClipCursorFn = BOOL (WINAPI*)(const RECT*);
+using XInputGetStateFn = DWORD (WINAPI*)(DWORD, XINPUT_STATE*);
+using XInputGetKeystrokeFn = DWORD (WINAPI*)(DWORD, DWORD, PXINPUT_KEYSTROKE);
+
+GetAsyncKeyStateFn g_originalGetAsyncKeyState = nullptr;
+GetKeyStateFn g_originalGetKeyState = nullptr;
+GetKeyboardStateFn g_originalGetKeyboardState = nullptr;
+GetRawInputDataFn g_originalGetRawInputData = nullptr;
+GetRawInputBufferFn g_originalGetRawInputBuffer = nullptr;
+GetCursorPosFn g_originalGetCursorPos = nullptr;
+SetCursorPosFn g_originalSetCursorPos = nullptr;
+ClipCursorFn g_originalClipCursor = nullptr;
+XInputGetStateFn g_originalXInputGetState = nullptr;
+XInputGetKeystrokeFn g_originalXInputGetKeystroke = nullptr;
+HWND g_hwnd = nullptr;
+WNDPROC g_originalWndProc = nullptr;
+ID3D11Device* g_device = nullptr;
+ID3D11DeviceContext* g_context = nullptr;
+ID3D11RenderTargetView* g_rtv = nullptr;
+ID3D11ShaderResourceView* g_backgroundSrv = nullptr;
+bool g_imguiReady = false;
+float g_uiScale = 1.0f;
+float g_uiScaleDraft = 1.0f;
+float g_lastUiScale = -1.0f;
+ImGuiStyle g_baseStyle{};
+bool g_baseStyleCaptured = false;
+std::atomic<bool> g_presentSeen{false};
+std::wstring g_logPath;
+
+// BatLit viewport gizmo - intentionally lightweight and read-only.
+bool g_showLightGizmo = true;
+bool g_showGizmoRadius = true;
+bool g_showGizmoAxis = true;
+bool g_showGizmoCone = true;
+uint32_t g_gizmoLightId = 0;
+
+// Forward declaration: input hooks are installed before the logger definition.
+void Log(const wchar_t* text);
+
+RECT g_savedClipRect{};
+bool g_savedClipValid = false;
+bool g_inputCaptureActive = false;
+POINT g_gameFrozenCursor{};
+bool g_gameFrozenCursorValid = false;
+
+LRESULT CALLBACK HookWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+
+SHORT WINAPI HookGetAsyncKeyState(int vKey) {
+    // The configured UI-toggle key must remain available so BAK Tweaks can always be closed.
+    if (g_uiOpen.load() && vKey != g_hotkeyToggleUI) return 0;
+    return g_originalGetAsyncKeyState ? g_originalGetAsyncKeyState(vKey) : 0;
+}
+
+SHORT WINAPI HookGetKeyState(int vKey) {
+    if (g_uiOpen.load() && vKey != g_hotkeyToggleUI) return 0;
+    return g_originalGetKeyState ? g_originalGetKeyState(vKey) : 0;
+}
+
+BOOL WINAPI HookGetKeyboardState(PBYTE state) {
+    if (!g_originalGetKeyboardState) return FALSE;
+    const BOOL ok = g_originalGetKeyboardState(state);
+    if (ok && g_uiOpen.load() && state) {
+        const BYTE toggleKey = state[g_hotkeyToggleUI];
+        memset(state, 0, 256);
+        state[g_hotkeyToggleUI] = toggleKey;
+    }
+    return ok;
+}
+
+bool IsCallerInsideBatmanAK(void* caller) {
+    static uintptr_t base = 0;
+    static uintptr_t end = 0;
+    if (!base) {
+        HMODULE mod = GetModuleHandleW(L"BatmanAK.exe");
+        if (mod) {
+            auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(mod);
+            if (dos && dos->e_magic == IMAGE_DOS_SIGNATURE) {
+                auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(reinterpret_cast<uintptr_t>(mod) + dos->e_lfanew);
+                if (nt && nt->Signature == IMAGE_NT_SIGNATURE) {
+                    base = reinterpret_cast<uintptr_t>(mod);
+                    end = base + nt->OptionalHeader.SizeOfImage;
+                }
+            }
+        }
+    }
+    const uintptr_t p = reinterpret_cast<uintptr_t>(caller);
+    return base && p >= base && p < end;
+}
+
+void ZeroRawInputPayload(RAWINPUT* raw) {
+    if (!raw) return;
+    if (raw->header.dwType == RIM_TYPEMOUSE) {
+        raw->data.mouse.usFlags = 0;
+        raw->data.mouse.ulButtons = 0;
+        raw->data.mouse.ulRawButtons = 0;
+        raw->data.mouse.lLastX = 0;
+        raw->data.mouse.lLastY = 0;
+        raw->data.mouse.ulExtraInformation = 0;
+    } else if (raw->header.dwType == RIM_TYPEKEYBOARD) {
+        memset(&raw->data.keyboard, 0, sizeof(raw->data.keyboard));
+    }
+}
+
+UINT WINAPI HookGetRawInputData(HRAWINPUT hRawInput, UINT command, LPVOID data, PUINT size, UINT headerSize) {
+    if (!g_originalGetRawInputData) return static_cast<UINT>(-1);
+    const UINT result = g_originalGetRawInputData(hRawInput, command, data, size, headerSize);
+    if (g_uiOpen.load() && command == RID_INPUT && data && result != static_cast<UINT>(-1) &&
+        result >= sizeof(RAWINPUTHEADER)) {
+        ZeroRawInputPayload(reinterpret_cast<RAWINPUT*>(data));
+    }
+    return result;
+}
+
+UINT WINAPI HookGetRawInputBuffer(PRAWINPUT data, PUINT size, UINT headerSize) {
+    if (!g_originalGetRawInputBuffer) return static_cast<UINT>(-1);
+    const UINT count = g_originalGetRawInputBuffer(data, size, headerSize);
+    if (g_uiOpen.load() && data && count != static_cast<UINT>(-1)) {
+        PRAWINPUT cur = data;
+        for (UINT i = 0; i < count; ++i) {
+            ZeroRawInputPayload(cur);
+            ULONG_PTR next = reinterpret_cast<ULONG_PTR>(cur) + cur->header.dwSize;
+            next = (next + sizeof(ULONG_PTR) - 1) & ~(static_cast<ULONG_PTR>(sizeof(ULONG_PTR) - 1));
+            cur = reinterpret_cast<PRAWINPUT>(next);
+        }
+    }
+    return count;
+}
+
+BOOL WINAPI HookGetCursorPos(LPPOINT point) {
+    if (!g_originalGetCursorPos) return FALSE;
+    if (g_uiOpen.load() && point && g_gameFrozenCursorValid && IsCallerInsideBatmanAK(_ReturnAddress())) {
+        *point = g_gameFrozenCursor;
+        return TRUE;
+    }
+    return g_originalGetCursorPos(point);
+}
+
+BOOL WINAPI HookSetCursorPos(int x, int y) {
+    if (g_uiOpen.load() && IsCallerInsideBatmanAK(_ReturnAddress())) return TRUE;
+    return g_originalSetCursorPos ? g_originalSetCursorPos(x, y) : FALSE;
+}
+
+BOOL WINAPI HookClipCursor(const RECT* rect) {
+    if (g_uiOpen.load() && rect && IsCallerInsideBatmanAK(_ReturnAddress())) return TRUE;
+    return g_originalClipCursor ? g_originalClipCursor(rect) : FALSE;
+}
+
+DWORD WINAPI HookXInputGetState(DWORD userIndex, XINPUT_STATE* state) {
+    if (!g_originalXInputGetState) return ERROR_DEVICE_NOT_CONNECTED;
+    const DWORD result = g_originalXInputGetState(userIndex, state);
+    if (result == ERROR_SUCCESS && g_uiOpen.load() && state) {
+        const DWORD packet = state->dwPacketNumber;
+        memset(&state->Gamepad, 0, sizeof(state->Gamepad));
+        state->dwPacketNumber = packet;
+    }
+    return result;
+}
+
+DWORD WINAPI HookXInputGetKeystroke(DWORD userIndex, DWORD reserved, PXINPUT_KEYSTROKE keystroke) {
+    if (g_uiOpen.load()) {
+        if (keystroke) memset(keystroke, 0, sizeof(*keystroke));
+        return ERROR_EMPTY;
+    }
+    return g_originalXInputGetKeystroke
+        ? g_originalXInputGetKeystroke(userIndex, reserved, keystroke)
+        : ERROR_DEVICE_NOT_CONNECTED;
+}
+
+bool CreateAndEnableInputHook(void* target, void* detour, void** original) {
+    if (!target) return false;
+    const MH_STATUS create = MH_CreateHook(target, detour, original);
+    if (create != MH_OK && create != MH_ERROR_ALREADY_CREATED) return false;
+    const MH_STATUS enable = MH_EnableHook(target);
+    return enable == MH_OK || enable == MH_ERROR_ENABLED;
+}
+
+void InstallHardInputBlockHooks() {
+    const MH_STATUS init = MH_Initialize();
+    if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) {
+        Log(L"Input block: MinHook init failed");
+        return;
+    }
+
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    bool asyncOk = false, keyOk = false, keyboardOk = false;
+    bool rawDataOk = false, rawBufferOk = false, getCursorOk = false, setCursorOk = false, clipCursorOk = false;
+    if (user32) {
+        asyncOk = CreateAndEnableInputHook(
+            reinterpret_cast<void*>(GetProcAddress(user32, "GetAsyncKeyState")),
+            reinterpret_cast<void*>(&HookGetAsyncKeyState),
+            reinterpret_cast<void**>(&g_originalGetAsyncKeyState));
+        keyOk = CreateAndEnableInputHook(
+            reinterpret_cast<void*>(GetProcAddress(user32, "GetKeyState")),
+            reinterpret_cast<void*>(&HookGetKeyState),
+            reinterpret_cast<void**>(&g_originalGetKeyState));
+        keyboardOk = CreateAndEnableInputHook(
+            reinterpret_cast<void*>(GetProcAddress(user32, "GetKeyboardState")),
+            reinterpret_cast<void*>(&HookGetKeyboardState),
+            reinterpret_cast<void**>(&g_originalGetKeyboardState));
+        rawDataOk = CreateAndEnableInputHook(
+            reinterpret_cast<void*>(GetProcAddress(user32, "GetRawInputData")),
+            reinterpret_cast<void*>(&HookGetRawInputData),
+            reinterpret_cast<void**>(&g_originalGetRawInputData));
+        rawBufferOk = CreateAndEnableInputHook(
+            reinterpret_cast<void*>(GetProcAddress(user32, "GetRawInputBuffer")),
+            reinterpret_cast<void*>(&HookGetRawInputBuffer),
+            reinterpret_cast<void**>(&g_originalGetRawInputBuffer));
+        getCursorOk = CreateAndEnableInputHook(
+            reinterpret_cast<void*>(GetProcAddress(user32, "GetCursorPos")),
+            reinterpret_cast<void*>(&HookGetCursorPos),
+            reinterpret_cast<void**>(&g_originalGetCursorPos));
+        setCursorOk = CreateAndEnableInputHook(
+            reinterpret_cast<void*>(GetProcAddress(user32, "SetCursorPos")),
+            reinterpret_cast<void*>(&HookSetCursorPos),
+            reinterpret_cast<void**>(&g_originalSetCursorPos));
+        clipCursorOk = CreateAndEnableInputHook(
+            reinterpret_cast<void*>(GetProcAddress(user32, "ClipCursor")),
+            reinterpret_cast<void*>(&HookClipCursor),
+            reinterpret_cast<void**>(&g_originalClipCursor));
+    }
+
+    // Arkham Knight normally uses xinput1_3, but accept the common Windows variants.
+    HMODULE xinput = nullptr;
+    const wchar_t* xinputNames[] = { L"xinput1_3.dll", L"xinput1_4.dll", L"xinput9_1_0.dll" };
+    for (const wchar_t* name : xinputNames) {
+        xinput = GetModuleHandleW(name);
+        if (xinput) break;
+    }
+
+    bool xiStateOk = false, xiKeyOk = false;
+    if (xinput) {
+        xiStateOk = CreateAndEnableInputHook(
+            reinterpret_cast<void*>(GetProcAddress(xinput, "XInputGetState")),
+            reinterpret_cast<void*>(&HookXInputGetState),
+            reinterpret_cast<void**>(&g_originalXInputGetState));
+        void* keyProc = reinterpret_cast<void*>(GetProcAddress(xinput, "XInputGetKeystroke"));
+        if (keyProc) {
+            xiKeyOk = CreateAndEnableInputHook(
+                keyProc,
+                reinterpret_cast<void*>(&HookXInputGetKeystroke),
+                reinterpret_cast<void**>(&g_originalXInputGetKeystroke));
+        }
+    }
+
+    wchar_t msg[384]{};
+    swprintf_s(msg, L"Input hooks: Async=%d Key=%d Keyboard=%d RawData=%d RawBuffer=%d GetCursor=%d SetCursor=%d ClipCursor=%d XInputState=%d XInputKey=%d",
+               asyncOk ? 1 : 0, keyOk ? 1 : 0, keyboardOk ? 1 : 0,
+               rawDataOk ? 1 : 0, rawBufferOk ? 1 : 0, getCursorOk ? 1 : 0, setCursorOk ? 1 : 0, clipCursorOk ? 1 : 0,
+               xiStateOk ? 1 : 0, xiKeyOk ? 1 : 0);
+    Log(msg);
+}
+
+void EnsureLogPath() {
+    if (!g_logPath.empty()) return;
+    wchar_t path[MAX_PATH]{};
+    GetModuleFileNameW(g_module, path, MAX_PATH);
+    std::wstring p(path);
+    const size_t slash = p.find_last_of(L"\\/");
+    g_logPath = (slash == std::wstring::npos ? L"BAKTweaks.log" : p.substr(0, slash + 1) + L"BAKTweaks.log");
+}
+
+void EnsureConfigPath() {
+    if (!g_configPath.empty()) return;
+
+    wchar_t path[MAX_PATH]{};
+    GetModuleFileNameW(g_module, path, MAX_PATH);
+    std::wstring p(path);
+    const size_t slash = p.find_last_of(L"\\/");
+
+    g_configPath =
+        (slash == std::wstring::npos)
+        ? L"BAKTweaks.ini"
+        : p.substr(0, slash + 1) + L"BAKTweaks.ini";
+}
+
+bool IsKeyboardHotkey(int vk) {
+    if (vk <= 0 || vk > 0xFE)
+        return false;
+
+    switch (vk) {
+        case VK_LBUTTON:
+        case VK_RBUTTON:
+        case VK_MBUTTON:
+        case VK_XBUTTON1:
+        case VK_XBUTTON2:
+            return false;
+        default:
+            break;
+    }
+
+    if (vk == VK_PACKET || vk == VK_PROCESSKEY)
+        return false;
+
+    return true;
+}
+
+std::string VirtualKeyName(int vk) {
+    switch (vk) {
+        case VK_BACK: return "Backspace";
+        case VK_TAB: return "Tab";
+        case VK_RETURN: return "Enter";
+        case VK_SHIFT: return "Shift";
+        case VK_CONTROL: return "Ctrl";
+        case VK_MENU: return "Alt";
+        case VK_PAUSE: return "Pause";
+        case VK_CAPITAL: return "Caps Lock";
+        case VK_ESCAPE: return "Escape";
+        case VK_SPACE: return "Space";
+        case VK_PRIOR: return "Page Up";
+        case VK_NEXT: return "Page Down";
+        case VK_END: return "End";
+        case VK_HOME: return "Home";
+        case VK_LEFT: return "Left Arrow";
+        case VK_UP: return "Up Arrow";
+        case VK_RIGHT: return "Right Arrow";
+        case VK_DOWN: return "Down Arrow";
+        case VK_INSERT: return "Insert";
+        case VK_DELETE: return "Delete";
+        case VK_LWIN: return "Left Windows";
+        case VK_RWIN: return "Right Windows";
+        case VK_NUMLOCK: return "Num Lock";
+        case VK_SCROLL: return "Scroll Lock";
+        case VK_LSHIFT: return "Left Shift";
+        case VK_RSHIFT: return "Right Shift";
+        case VK_LCONTROL: return "Left Ctrl";
+        case VK_RCONTROL: return "Right Ctrl";
+        case VK_LMENU: return "Left Alt";
+        case VK_RMENU: return "Right Alt";
+        case VK_OEM_1: return ";";
+        case VK_OEM_PLUS: return "=";
+        case VK_OEM_COMMA: return ",";
+        case VK_OEM_MINUS: return "-";
+        case VK_OEM_PERIOD: return ".";
+        case VK_OEM_2: return "/";
+        case VK_OEM_3: return "`";
+        case VK_OEM_4: return "[";
+        case VK_OEM_5: return "\\";
+        case VK_OEM_6: return "]";
+        case VK_OEM_7: return "'";
+        default:
+            break;
+    }
+
+    if (vk >= '0' && vk <= '9')
+        return std::string(1, static_cast<char>(vk));
+    if (vk >= 'A' && vk <= 'Z')
+        return std::string(1, static_cast<char>(vk));
+    if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9)
+        return "Numpad " + std::to_string(vk - VK_NUMPAD0);
+    if (vk >= VK_F1 && vk <= VK_F24)
+        return "F" + std::to_string(vk - VK_F1 + 1);
+
+    switch (vk) {
+        case VK_MULTIPLY: return "Numpad *";
+        case VK_ADD: return "Numpad +";
+        case VK_SEPARATOR: return "Numpad Separator";
+        case VK_SUBTRACT: return "Numpad -";
+        case VK_DECIMAL: return "Numpad .";
+        case VK_DIVIDE: return "Numpad /";
+        default:
+            break;
+    }
+
+    UINT scan = MapVirtualKeyW(static_cast<UINT>(vk), MAPVK_VK_TO_VSC);
+    LONG lParam = static_cast<LONG>(scan << 16);
+
+    if (vk == VK_LEFT || vk == VK_UP || vk == VK_RIGHT || vk == VK_DOWN ||
+        vk == VK_PRIOR || vk == VK_NEXT || vk == VK_END || vk == VK_HOME ||
+        vk == VK_INSERT || vk == VK_DELETE || vk == VK_DIVIDE ||
+        vk == VK_NUMLOCK || vk == VK_RCONTROL || vk == VK_RMENU) {
+        lParam |= (1 << 24);
+    }
+
+    wchar_t name[128]{};
+    if (GetKeyNameTextW(lParam, name, 128) > 0) {
+        char utf8[256]{};
+        const int len = WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8, sizeof(utf8), nullptr, nullptr);
+        if (len > 0)
+            return utf8;
+    }
+
+    char fallback[32]{};
+    snprintf(fallback, sizeof(fallback), "VK 0x%02X", vk);
+    return fallback;
+}
+
+int g_hotkeyCaptureTarget = 0; // 0=none, 1=UI, 2=Small, 3=Vertical
+bool g_hotkeyCaptureArmed = false;
+
+bool IsRawKeyDown(int vk) {
+    if (g_originalGetAsyncKeyState)
+        return (g_originalGetAsyncKeyState(vk) & 0x8000) != 0;
+
+    return false;
+}
+
+bool DrawHotkeyCapture(const char* label, int target, int& vk) {
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine(180.0f);
+
+    const std::string keyName = VirtualKeyName(vk);
+    ImGui::TextDisabled("%s", keyName.c_str());
+    ImGui::SameLine(300.0f);
+
+    ImGui::PushID(target);
+    bool changed = false;
+
+    if (g_hotkeyCaptureTarget == target) {
+        if (ImGui::Button("Press any key...")) {
+            g_hotkeyCaptureTarget = 0;
+            g_hotkeyCaptureArmed = false;
+        }
+
+        bool anyDown = false;
+        for (int key = 1; key <= 0xFE; ++key) {
+            if (!IsKeyboardHotkey(key)) continue;
+            if (IsRawKeyDown(key)) {
+                anyDown = true;
+                break;
+            }
+        }
+
+        if (!g_hotkeyCaptureArmed) {
+            if (!anyDown)
+                g_hotkeyCaptureArmed = true;
+        } else {
+            for (int key = 1; key <= 0xFE; ++key) {
+                if (!IsKeyboardHotkey(key)) continue;
+                if (IsRawKeyDown(key)) {
+                    vk = key;
+                    g_hotkeyCaptureTarget = 0;
+                    g_hotkeyCaptureArmed = false;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+    } else {
+        if (ImGui::Button("Change")) {
+            g_hotkeyCaptureTarget = target;
+            g_hotkeyCaptureArmed = false;
+        }
+    }
+
+    ImGui::PopID();
+    return changed;
+}
+
+void SaveHotkeyConfig() {
+    EnsureConfigPath();
+    if (g_configPath.empty()) return;
+
+    wchar_t value[32]{};
+
+    swprintf_s(value, L"%d", g_hotkeyToggleUI);
+    WritePrivateProfileStringW(L"Shortcuts", L"ToggleUI", value, g_configPath.c_str());
+
+    swprintf_s(value, L"%d", g_hotkeySmallLightning);
+    WritePrivateProfileStringW(L"Shortcuts", L"SmallLightning", value, g_configPath.c_str());
+
+    swprintf_s(value, L"%d", g_hotkeyVerticalLightning);
+    WritePrivateProfileStringW(L"Shortcuts", L"VerticalLightning", value, g_configPath.c_str());
+}
+
+void LoadHotkeyConfig() {
+    EnsureConfigPath();
+    if (g_configPath.empty()) return;
+
+    const int ui = GetPrivateProfileIntW(L"Shortcuts", L"ToggleUI", VK_F10, g_configPath.c_str());
+    const int smallKey = GetPrivateProfileIntW(L"Shortcuts", L"SmallLightning", VK_F6, g_configPath.c_str());
+    const int vertical = GetPrivateProfileIntW(L"Shortcuts", L"VerticalLightning", VK_F7, g_configPath.c_str());
+
+    g_hotkeyToggleUI = IsKeyboardHotkey(ui) ? ui : VK_F10;
+    g_hotkeySmallLightning = IsKeyboardHotkey(smallKey) ? smallKey : VK_F6;
+    g_hotkeyVerticalLightning = IsKeyboardHotkey(vertical) ? vertical : VK_F7;
+}
+
+void ResetSessionLog() {
+    EnsureLogPath();
+    FILE* f = nullptr;
+    _wfopen_s(&f, g_logPath.c_str(), L"w, ccs=UTF-8");
+    if (f) fclose(f);
+}
+
+void Log(const wchar_t* text) {
+    EnsureLogPath();
+    FILE* f = nullptr;
+    _wfopen_s(&f, g_logPath.c_str(), L"a+, ccs=UTF-8");
+    if (f) { fwprintf(f, L"%s\n", text); fclose(f); }
+    OutputDebugStringW(text);
+    OutputDebugStringW(L"\n");
+}
+
+
+// -----------------------------------------------------------------------------
+// BatLit - native UE3 light manager (no BmSDK script / no companion file)
+// Offsets below mirror Team-BmSDK/BmSDK-AK Steam definitions for BatmanAK.exe.
+// Engine work is executed only from the top-level FEngineLoop::Tick game-thread hook; never from D3D Present or nested ProcessInternal.
+// -----------------------------------------------------------------------------
+static constexpr const char* kBAKTweaksVersion = "v5.24";
+
+namespace BatLitNative {
+constexpr uintptr_t kStaticFindObject = 0x00F3B7F0;
+constexpr uintptr_t kProcessEvent     = 0x00F90CD0;
+constexpr uintptr_t kSpawnActor       = 0x00ACBC70;
+constexpr uintptr_t kGetDefaultObject = 0x00F92870;
+constexpr uintptr_t kEngineTick       = 0x005B1DA0;
+constexpr uintptr_t kGObjects         = 0x0340CBE4;
+constexpr int       kGObjectsCapacity = 785000;
+constexpr uintptr_t kGObjectsNumOff   = 0x03A09F28; // kGObjects + sizeof(Data) + Unk
+constexpr uint32_t  kExpectedTimeDateStamp = 0x5F8AA2F9u;
+constexpr uint32_t  kExpectedSizeOfImage   = 0x04398000u;
+
+// Exposure: confirmed LevelPP writer and value location for this BatmanAK.exe build.
+constexpr uintptr_t kExposureLevelPPWriter = 0x009F3779;
+constexpr ptrdiff_t kLocalPlayerLevelPPExposureBaseOffset = 0x474;
+constexpr uint8_t kExposureWriterOriginal[8] = { 0xF3,0x0F,0x11,0x8B,0x64,0x01,0x00,0x00 };
+
+constexpr ptrdiff_t kUObjectFlags = 0x08;
+constexpr ptrdiff_t kUObjectOuter = 0x34;
+constexpr ptrdiff_t kUObjectClass = 0x44;
+constexpr ptrdiff_t kUStructSuper = 0x5C;
+constexpr uint32_t  kRF_ClassDefaultObject = 0x80;
+constexpr ptrdiff_t kUFunctionFlags = 0xA4; // +164
+constexpr ptrdiff_t kUFunctionNativeIndex = 0xA8; // +168
+constexpr uint32_t  kFUNC_Native = 0x00000400u;
+constexpr uint32_t  kFUNC_Defined = 0x00000002u;
+
+constexpr ptrdiff_t kLightActorComponent = 0x29C; // Engine.Light.LightComponent
+constexpr ptrdiff_t kPlayerControllerPlayerCamera = 0x478; // +1144
+constexpr ptrdiff_t kCameraCache = 0x570; // +1392
+constexpr ptrdiff_t kCameraCachePOV = 0x04;
+constexpr ptrdiff_t kActorLocation = 0x0C4; // Engine.Actor.Location +196
+constexpr ptrdiff_t kActorRotation = 0x0D0; // Engine.Actor.Rotation +208
+
+struct Vec3 { float x{}, y{}, z{}; };
+struct RotatorRaw { int32_t pitch{}, yaw{}, roll{}; };
+struct FNameRaw { int32_t index{}, number{}; };
+struct ColorBGRA { uint8_t b{}, g{}, r{}, a{255}; };
+
+using StaticFindObjectFn = void* (__cdecl*)(void*, void*, const wchar_t*, int);
+using ProcessEventFn     = void  (__fastcall*)(void*, void*, void*, void*);
+using SpawnActorFn       = void* (__fastcall*)(void*, void*, FNameRaw, Vec3*, RotatorRaw*, void*, int, int, void*, void*, int, void*);
+using GetDefaultObjectFn = void* (__fastcall*)(void*, int);
+using EngineTickFn       = intptr_t (__fastcall*)(void*);
+
+StaticFindObjectFn g_staticFindObject = nullptr;
+ProcessEventFn g_processEvent = nullptr;
+SpawnActorFn g_spawnActor = nullptr;
+GetDefaultObjectFn g_getDefaultObject = nullptr;
+EngineTickFn g_originalEngineTick = nullptr;
+std::atomic<DWORD> g_gameThreadId{0};
+thread_local bool g_inCommandDispatch = false;
+uintptr_t g_gameBase = 0;
+void* g_classFunction = nullptr;
+void* g_classPointLightMovable = nullptr;
+void* g_classSpotLightMovable = nullptr;
+void* g_classPlayerController = nullptr;
+void* g_classWorldInfo = nullptr;
+void* g_classEngine = nullptr;
+void* g_classRRainComponent = nullptr;
+void* g_classRPollenComponent = nullptr;
+void* g_classRDustComponent = nullptr;
+void* g_classRSnowComponent = nullptr;
+void* g_classExponentialHeightFogComponent = nullptr;
+void* g_classRPawnPlayerBm = nullptr;
+int g_uPropertyOffsetField = -1;
+int g_rainParticleCountOffset = -1;
+int g_pollenParticleCountOffset = -1;
+int g_dustParticleCountOffset = -1;
+int g_snowParticleCountOffset = -1;
+int g_fogStartDistanceOffset = -1;
+int g_fogMaxOpacityOffset = -1;
+int g_fogHeightFalloffOffset = -1;
+int g_fogDensityOffset = -1;
+int g_fogHeightOffset = -1;
+int g_radioModeEyesOffset = -1;
+uint32_t g_radioModeEyesMask = 0;
+void* g_lastPlayerController = nullptr;
+void* g_fnGetPlayerViewPoint = nullptr;
+void* g_fnWorldInfoGetWorldInfo = nullptr;
+void* g_fnEngineGetEngine = nullptr;
+void* g_fnFindPlayerByControllerId = nullptr;
+void* g_fnSetEnabled = nullptr;
+void* g_fnLightColor = nullptr;
+void* g_fnBrightness = nullptr;
+void* g_fnUpdateColorBrightness = nullptr;
+void* g_fnUpdateShafts = nullptr;
+void* g_fnSetTranslation = nullptr;
+void* g_fnSetAngleRadius = nullptr;
+void* g_fnSetRotation = nullptr;
+void* g_fnSetAbsoluteRotation = nullptr;
+void* g_fnActorSetLocation = nullptr;
+void* g_fnActorSetRotation = nullptr;
+void* g_fnActorDestroy = nullptr;
+void* g_fnIgnoreMoveInput = nullptr;
+void* g_fnIgnoreLookInput = nullptr;
+void* g_fnIgnoreButtonInput = nullptr;
+void* g_fnIsMoveInputIgnored = nullptr;
+void* g_fnIsLookInputIgnored = nullptr;
+void* g_fnIsButtonInputIgnored = nullptr;
+void* g_fnResetPlayerMovementInput = nullptr;
+void* g_fnFogSetEnabled = nullptr;
+void* g_fnRadioModeEyesAndEffects = nullptr;
+void* g_fnConsoleCommand = nullptr;
+std::atomic<int> g_radioEyesRequest{-1}; // -1 none, 0 off, 1 on
+std::mutex g_consoleCommandMutex;
+std::vector<std::wstring> g_consoleCommandQueue;
+std::atomic<bool> g_forceInputRelease{false};
+
+// Lightning VFX (validated on this exact v5.23 BatmanAK build).
+// Re-use the two natural PSCs owned by the live RLightningActor because these
+// are already registered with the renderer (SceneInfo != 0). Newly pooled PSCs
+// were created correctly but remained unregistered/invisible.
+void* g_classRLightningActor = nullptr;
+void* g_fnParticleActivateSystem = nullptr;
+void* g_fnParticleDeactivateSystem = nullptr;
+void* g_fnPrimitiveSetTranslation = nullptr;
+void* g_normalLightningLifetimeModule = nullptr;
+void* g_verticalLightningLifetimeModule = nullptr;
+void* g_normalLightningSpawnModule = nullptr;
+void* g_verticalLightningSpawnModule = nullptr;
+constexpr ptrdiff_t kRLightningNormalPSC = 0x2B4;
+constexpr ptrdiff_t kRLightningVerticalPSC = 0x2AC;
+constexpr ptrdiff_t kParticleLifetimeRawDistribution = 0x60;
+std::mutex g_lightningRequestMutex;
+int g_lightningRequestType = 0; // 0 none, 1 small/normal, 2 vertical
+float g_lightningRequestDuration = 1.0f;
+float g_lightningRequestDistance = 5000.0f;
+void* g_lightningActorCache = nullptr;
+void* g_normalLightningPSCCache = nullptr;
+void* g_verticalLightningPSCCache = nullptr;
+std::atomic<bool> g_lightningCacheReady{false};
+std::atomic<bool> g_lightningCEBusy{false};
+
+// Lightning settings are shared by the UI and the F6/F7 shortcuts.
+// This guarantees that a shortcut fired with the UI hidden uses the
+// exact values last configured in the Lightning panel.
+float g_smallLightningDuration = 1.0f;
+float g_smallLightningDistance = 5000.0f;
+int g_smallLightningInstances = 1;
+int g_smallLightningSalvoCount = 1;
+float g_smallLightningSalvoInterval = 0.08f;
+int g_smallLightningClusters = 1;
+float g_smallLightningClusterSpread = 0.08f;
+
+float g_verticalLightningDuration = 1.0f;
+float g_verticalLightningDistance = 5000.0f;
+int g_verticalLightningInstances = 1;
+int g_verticalLightningSalvoCount = 1;
+float g_verticalLightningSalvoInterval = 0.08f;
+int g_verticalLightningClusters = 1;
+float g_verticalLightningClusterSpread = 0.08f;
+
+bool g_lightningRandomizePosition = true;
+float g_lightningSpreadX = 0.80f;
+float g_lightningSpreadY = 0.65f;
+float g_lightningDistanceJitter = 0.15f;
+// Exact GObject indices from the validated CE session / current ObjectsDump.
+constexpr int kGObj_RLightningActorClass = 1791;
+constexpr int kGObj_SmallLifetimeModule = 209911;
+constexpr int kGObj_VerticalLifetimeModule = 209923;
+constexpr int kGObj_SmallSpawnModule = 209910;
+constexpr int kGObj_VerticalSpawnModule = 209922;
+constexpr int kGObj_ParticleModuleSpawn_BurstList = 32501;
+constexpr int kGObj_ParticleBurst_Time = 31865;
+constexpr int kGObj_ParticleBurst_CountLow = 31866;
+constexpr int kGObj_ParticleBurst_Count = 31867;
+
+struct LightningPreparedRequest {
+    void* psc{};
+    void* lifetimeModule{};
+    float seconds{1.0f};
+    float distance{5000.0f};
+    int instances{1};
+    int salvoCount{1};
+    float salvoInterval{0.08f};
+    int clusterCount{1};
+    float clusterSpread{0.08f};
+    bool vertical{};
+    bool randomizePosition{};
+    float spreadX{0.80f};
+    float spreadY{0.65f};
+    float distanceJitter{0.15f};
+};
+std::mutex g_lightningPreparedMutex;
+LightningPreparedRequest g_lightningPrepared{};
+std::atomic<bool> g_lightningPreparedReady{false};
+std::mutex g_lightningStatusMutex;
+std::wstring g_lightningStatus = L"Idle";
+
+// UE3-level input block state. This is the authoritative blocker for Batman's
+// own PlayerController input; Win32/XInput hooks below are only secondary guards.
+void* g_inputBlockPC = nullptr;
+bool g_inputSnapshotValid = false;
+bool g_prevMoveIgnored = false;
+bool g_prevLookIgnored = false;
+bool g_prevButtonIgnored = false;
+
+bool IsReadableAddress(const void* ptr, size_t bytes = 1) {
+    if (!ptr || bytes == 0) return false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(ptr, &mbi, sizeof(mbi))) return false;
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return false;
+    const uintptr_t a = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t z = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+    return a + bytes <= z;
+}
+
+bool IsExecutableAddress(const void* ptr) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!ptr || !VirtualQuery(ptr, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
+    const DWORD p = mbi.Protect & 0xff;
+    return p == PAGE_EXECUTE || p == PAGE_EXECUTE_READ || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
+}
+
+template <typename T> T Read(void* base, ptrdiff_t off) {
+    if (!IsReadableAddress(reinterpret_cast<uint8_t*>(base) + off, sizeof(T))) return T{};
+    return *reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(base) + off);
+}
+template <typename T> void Write(void* base, ptrdiff_t off, const T& value) {
+    if (!IsReadableAddress(reinterpret_cast<uint8_t*>(base) + off, sizeof(T))) return;
+    *reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(base) + off) = value;
+}
+
+int32_t DegreesToRuu(float degrees) {
+    return static_cast<int32_t>(std::lround(degrees * (65536.0f / 360.0f)));
+}
+float RuuToDegrees(int32_t ruu) {
+    return static_cast<float>(ruu) * (360.0f / 65536.0f);
+}
+
+void* FindObject(const wchar_t* path, bool exact = false) {
+    if (!g_staticFindObject) return nullptr;
+    return g_staticFindObject(nullptr, reinterpret_cast<void*>(static_cast<intptr_t>(-1)), path, exact ? 1 : 0);
+}
+void* FindFunction(const wchar_t* path) {
+    if (!g_staticFindObject || !g_classFunction) return nullptr;
+    return g_staticFindObject(g_classFunction, reinterpret_cast<void*>(static_cast<intptr_t>(-1)), path, 1);
+}
+
+bool IsA(void* object, void* targetClass) {
+    if (!object || !targetClass || !IsReadableAddress(reinterpret_cast<uint8_t*>(object) + kUObjectClass, sizeof(void*))) return false;
+    void* cls = Read<void*>(object, kUObjectClass);
+    for (int depth = 0; cls && depth < 128; ++depth) {
+        if (cls == targetClass) return true;
+        if (!IsReadableAddress(reinterpret_cast<uint8_t*>(cls) + kUStructSuper, sizeof(void*))) break;
+        cls = Read<void*>(cls, kUStructSuper);
+    }
+    return false;
+}
+
+int GObjectCount() {
+    if (!g_gameBase) return 0;
+    auto* p = reinterpret_cast<int*>(g_gameBase + kGObjectsNumOff);
+    if (!IsReadableAddress(p, sizeof(int))) return 0;
+    const int n = *p;
+    return (n > 0 && n <= kGObjectsCapacity) ? n : kGObjectsCapacity;
+}
+
+void* SafeGObjectAt(void** objects, int index) {
+    if (!objects || index < 0) return nullptr;
+    __try { return objects[index]; }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+
+void* GObjectAtFixedIndex(int index) {
+    if (!g_gameBase || index < 0 || index >= GObjectCount()) return nullptr;
+    auto** objects = reinterpret_cast<void**>(g_gameBase + kGObjects);
+    return SafeGObjectAt(objects, index);
+}
+
+void SetLightningStatus(const wchar_t* status) {
+    std::lock_guard<std::mutex> lock(g_lightningStatusMutex);
+    g_lightningStatus = status ? status : L"";
+}
+
+std::wstring GetLightningStatus() {
+    std::lock_guard<std::mutex> lock(g_lightningStatusMutex);
+    return g_lightningStatus;
+}
+
+void* FindLiveObjectOfClass(void* cls) {
+    if (!g_gameBase || !cls) return nullptr;
+    auto** objects = reinterpret_cast<void**>(g_gameBase + kGObjects);
+    const int n = GObjectCount();
+    for (int i = 0; i < n; ++i) {
+        void* obj = SafeGObjectAt(objects, i);
+        if (!obj || !IsReadableAddress(obj, 0x4C)) continue;
+        const uint32_t flags = Read<uint32_t>(obj, kUObjectFlags);
+        if (flags & kRF_ClassDefaultObject) continue;
+        if (IsA(obj, cls)) return obj;
+    }
+    return nullptr;
+}
+
+// Fast exact-class GObjects scan used only by the lightning resolver.
+// This deliberately mirrors the CE test: raw GObjects pointer walk + direct
+// UObject.Class comparison. No VirtualQuery and no superclass walk per object.
+void* FindLiveExactClassRaw(void* exactClass) {
+    if (!g_gameBase || !exactClass) return nullptr;
+    auto** objects = reinterpret_cast<void**>(g_gameBase + kGObjects);
+    int n = 0;
+    __try { n = *reinterpret_cast<int*>(g_gameBase + kGObjectsNumOff); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+    if (n <= 0 || n > kGObjectsCapacity) n = kGObjectsCapacity;
+
+    for (int i = 0; i < n; ++i) {
+        __try {
+            void* obj = objects[i];
+            if (!obj) continue;
+            if (*reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(obj) + kUObjectClass) != exactClass) continue;
+            const uint32_t flags = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(obj) + kUObjectFlags);
+            if (flags & kRF_ClassDefaultObject) continue;
+            return obj;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            // Sparse / stale GObjects entries are simply skipped, exactly as CE does.
+        }
+    }
+    return nullptr;
+}
+
+bool IsExactClassRaw(void* obj, void* exactClass) {
+    if (!obj || !exactClass) return false;
+    __try {
+        return *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(obj) + kUObjectClass) == exactClass &&
+               ((*reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(obj) + kUObjectFlags) & kRF_ClassDefaultObject) == 0);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool ProcessEvent(void* object, void* fn, void* params) {
+    if (!object || !fn || !g_processEvent) return false;
+    __try { g_processEvent(object, fn, params, nullptr); return true; }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool ProcessScriptEvent(void* object, void* fn, void* params) {
+    if (!object || !fn || !g_processEvent || !IsReadableAddress(reinterpret_cast<uint8_t*>(fn) + 168, 2)) return false;
+    auto* flags = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(fn) + 164);
+    auto* nativeIndex = reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(fn) + 168);
+    uint32_t oldFlags = 0;
+    uint16_t oldNative = 0;
+    __try {
+        oldFlags = *flags;
+        oldNative = *nativeIndex;
+        *flags = (oldFlags & ~0x400u) | 0x2u; // !FUNC_Native, FUNC_Defined
+        *nativeIndex = 0;
+        g_processEvent(object, fn, params, nullptr);
+        *nativeIndex = oldNative;
+        *flags = oldFlags;
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        __try { *nativeIndex = oldNative; *flags = oldFlags; } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        return false;
+    }
+}
+
+
+void* GetPlayerController_BmSDKPath();
+
+bool GetIgnoredState(void* pc, void* fn, bool& out) {
+    if (!pc || !fn) return false;
+    alignas(8) uint8_t params[8]{};
+    if (!ProcessEvent(pc, fn, params)) return false;
+    uint32_t value = 0;
+    memcpy(&value, params, sizeof(value));
+    out = value != 0;
+    return true;
+}
+
+bool SetIgnoredState(void* pc, void* fn, bool value) {
+    if (!pc || !fn) return false;
+    alignas(8) uint8_t params[8]{};
+    const uint32_t v = value ? 1u : 0u;
+    memcpy(params, &v, sizeof(v));
+    return ProcessEvent(pc, fn, params);
+}
+
+void ClearInputBlockSnapshot() {
+    g_inputBlockPC = nullptr;
+    g_inputSnapshotValid = false;
+    g_prevMoveIgnored = false;
+    g_prevLookIgnored = false;
+    g_prevButtonIgnored = false;
+}
+
+void UpdateGameInputBlockOnGameThread() {
+    if (!g_fnIgnoreMoveInput || !g_fnIgnoreLookInput || !g_fnIgnoreButtonInput ||
+        !g_fnIsMoveInputIgnored || !g_fnIsLookInputIgnored || !g_fnIsButtonInputIgnored) return;
+    const bool open = g_uiOpen.load();
+
+    const bool forceRelease = g_forceInputRelease.exchange(false);
+    if (!open || forceRelease) {
+        // IMPORTANT FPS FIX:
+        // Once the UI is closed and our block has already been released, do NOTHING.
+        // The previous code re-resolved the PlayerController and fired 4 ProcessEvent
+        // calls + a log write on EVERY EngineTick while the UI was hidden.
+        // That made the closed-overlay state substantially more expensive than the open one.
+        if (!forceRelease && !g_inputBlockPC && !g_inputSnapshotValid)
+            return;
+
+        // Closing BAK Tweaks releases OUR block once on the next game tick.
+        void* pc = g_inputBlockPC;
+        if (!pc || !IsReadableAddress(pc, 0x4C) || !IsA(pc, g_classPlayerController))
+            pc = GetPlayerController_BmSDKPath();
+
+        if (pc) {
+            SetIgnoredState(pc, g_fnIgnoreMoveInput, false);
+            SetIgnoredState(pc, g_fnIgnoreLookInput, false);
+            SetIgnoredState(pc, g_fnIgnoreButtonInput, false);
+            if (g_fnResetPlayerMovementInput) ProcessEvent(pc, g_fnResetPlayerMovementInput, nullptr);
+            Log(L"INPUT UE3: hard release after UI close");
+        }
+        ClearInputBlockSnapshot();
+        return;
+    }
+
+    // If the controller changed because of F5/streaming, discard the stale snapshot
+    // and capture the replacement controller before blocking it.
+    if (!g_inputBlockPC || !IsReadableAddress(g_inputBlockPC, 0x4C) ||
+        !IsA(g_inputBlockPC, g_classPlayerController)) {
+        ClearInputBlockSnapshot();
+        g_inputBlockPC = GetPlayerController_BmSDKPath();
+        if (!g_inputBlockPC) return;
+    }
+
+    if (!g_inputSnapshotValid) {
+        bool move = false, look = false, button = false;
+        const bool okMove = GetIgnoredState(g_inputBlockPC, g_fnIsMoveInputIgnored, move);
+        const bool okLook = GetIgnoredState(g_inputBlockPC, g_fnIsLookInputIgnored, look);
+        const bool okButton = GetIgnoredState(g_inputBlockPC, g_fnIsButtonInputIgnored, button);
+        // Only restore states we actually captured. All three functions are expected
+        // on this build; if any lookup/call fails, use false as the conservative default.
+        g_prevMoveIgnored = okMove ? move : false;
+        g_prevLookIgnored = okLook ? look : false;
+        g_prevButtonIgnored = okButton ? button : false;
+        g_inputSnapshotValid = true;
+        Log(L"INPUT UE3: PlayerController captured; hard block active");
+    }
+
+    // Re-assert every game tick: Arkham Knight can rewrite these flags during state
+    // transitions, gadget changes and camera changes. This keeps BAK Tweaks exclusive.
+    SetIgnoredState(g_inputBlockPC, g_fnIgnoreMoveInput, true);
+    SetIgnoredState(g_inputBlockPC, g_fnIgnoreLookInput, true);
+    SetIgnoredState(g_inputBlockPC, g_fnIgnoreButtonInput, true);
+    // Arkham Knight can accumulate a mouse-look delta before/around the ignore flags.
+    // Clear it while the overlay is open so dragging/clicking ImGui never nudges the game camera.
+    if (g_fnResetPlayerMovementInput) ProcessEvent(g_inputBlockPC, g_fnResetPlayerMovementInput, nullptr);
+}
+
+void* GetEngine_BmSDKPath() {
+    if (!g_classEngine || !g_fnEngineGetEngine || !g_getDefaultObject || !g_processEvent)
+        return nullptr;
+
+    void* cdo = nullptr;
+    __try {
+        cdo = g_getDefaultObject(g_classEngine, 0);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        Log(L"TRACE 12: GetDefaultObject(Engine.Engine) exception");
+        return nullptr;
+    }
+    if (!cdo) {
+        Log(L"TRACE 12: Engine.Engine CDO null");
+        return nullptr;
+    }
+
+    alignas(8) uint8_t params[8]{};
+
+    auto* flags = reinterpret_cast<uint32_t*>(
+        reinterpret_cast<uint8_t*>(g_fnEngineGetEngine) + kUFunctionFlags);
+    auto* nativeIndex = reinterpret_cast<uint16_t*>(
+        reinterpret_cast<uint8_t*>(g_fnEngineGetEngine) + kUFunctionNativeIndex);
+
+    uint32_t oldFlags{};
+    uint16_t oldNative{};
+
+    __try {
+        oldFlags = *flags;
+        oldNative = *nativeIndex;
+
+        *flags = (oldFlags & ~kFUNC_Native) | kFUNC_Defined;
+        *nativeIndex = 0;
+
+        g_processEvent(cdo, g_fnEngineGetEngine, params, nullptr);
+
+        *nativeIndex = oldNative;
+        *flags = oldFlags;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        __try {
+            *nativeIndex = oldNative;
+            *flags = oldFlags;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        Log(L"TRACE 12: Engine.GetEngine ProcessEvent exception");
+        return nullptr;
+    }
+
+    void* engine = nullptr;
+    memcpy(&engine, params + 0, sizeof(void*));
+    return engine;
+}
+
+void* GetLocalPlayer_BmSDKPath() {
+    void* engine = GetEngine_BmSDKPath();
+    if (!engine) return nullptr;
+
+    // BmSDK Generated/Engine/_Engine.g.cs: ObjectProperty GameViewport @ +700.
+    void* viewport = Read<void*>(engine, 700);
+    if (!viewport || !g_fnFindPlayerByControllerId) return nullptr;
+
+    // BmSDK wrapper: params size 16, ControllerId @ +0, return LocalPlayer @ +4.
+    alignas(8) uint8_t params[16]{};
+    const int controllerId = 0;
+    memcpy(params + 0, &controllerId, sizeof(controllerId));
+    if (!ProcessEvent(viewport, g_fnFindPlayerByControllerId, params)) return nullptr;
+
+    void* localPlayer = nullptr;
+    memcpy(&localPlayer, params + 4, sizeof(void*));
+    return localPlayer;
+}
+
+bool PatchExposureLevelPPWriter(bool disableWriter) {
+    if (!g_gameBase) return false;
+    auto* site = reinterpret_cast<uint8_t*>(g_gameBase + kExposureLevelPPWriter);
+    if (!IsReadableAddress(site, sizeof(kExposureWriterOriginal))) return false;
+
+    const uint8_t nops[8] = {0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90};
+    const uint8_t* wanted = disableWriter ? nops : kExposureWriterOriginal;
+
+    if (disableWriter) {
+        // Refuse to patch an unexpected build/instruction. Already-NOPed is fine.
+        if (memcmp(site, kExposureWriterOriginal, sizeof(kExposureWriterOriginal)) != 0 &&
+            memcmp(site, nops, sizeof(nops)) != 0) {
+            Log(L"EXPOSURE: LevelPP writer bytes do not match expected instruction");
+            return false;
+        }
+    }
+
+    DWORD oldProtect{};
+    if (!VirtualProtect(site, sizeof(kExposureWriterOriginal), PAGE_EXECUTE_READWRITE, &oldProtect))
+        return false;
+    memcpy(site, wanted, sizeof(kExposureWriterOriginal));
+    DWORD dummy{};
+    VirtualProtect(site, sizeof(kExposureWriterOriginal), oldProtect, &dummy);
+    FlushInstructionCache(GetCurrentProcess(), site, sizeof(kExposureWriterOriginal));
+    return true;
+}
+
+void UpdateExposureOverrideOnGameThread() {
+    const bool wanted = g_exposureWanted.load();
+    bool applied = g_exposureApplied.load();
+
+    if (!wanted) {
+        if (applied) {
+            PatchExposureLevelPPWriter(false);
+            g_exposureApplied.store(false);
+            g_exposureLocalPlayer.store(0);
+            Log(L"EXPOSURE: LevelPP override disabled; game writer restored");
+        }
+        return;
+    }
+
+    uintptr_t localPlayer = g_exposureLocalPlayer.load();
+    if (!localPlayer || !IsReadableAddress(reinterpret_cast<void*>(localPlayer + kLocalPlayerLevelPPExposureBaseOffset), sizeof(float))) {
+        void* lp = GetLocalPlayer_BmSDKPath();
+        localPlayer = reinterpret_cast<uintptr_t>(lp);
+        if (!localPlayer || !IsReadableAddress(reinterpret_cast<void*>(localPlayer + kLocalPlayerLevelPPExposureBaseOffset), sizeof(float)))
+            return;
+        g_exposureLocalPlayer.store(localPlayer);
+    }
+
+    if (!applied) {
+        const float current = *reinterpret_cast<float*>(localPlayer + kLocalPlayerLevelPPExposureBaseOffset);
+        if (std::isfinite(current)) g_exposureValue.store(current);
+        if (!PatchExposureLevelPPWriter(true)) {
+            g_exposureWanted.store(false);
+            return;
+        }
+        g_exposureApplied.store(true);
+        applied = true;
+        wchar_t msg[192]{};
+        swprintf_s(msg, L"EXPOSURE: LevelPP override enabled LP=0x%llX value=%.3f",
+                   (unsigned long long)localPlayer, (double)g_exposureValue.load());
+        Log(msg);
+    }
+
+    if (applied) {
+        const float value = g_exposureValue.load();
+        if (std::isfinite(value))
+            *reinterpret_cast<float*>(localPlayer + kLocalPlayerLevelPPExposureBaseOffset) = value;
+    }
+}
+
+void* GetPlayerController_BmSDKPath() {
+    Log(L"TRACE 11: GetEngine begin");
+
+    void* engine = GetEngine_BmSDKPath();
+    if (!engine) {
+        Log(L"TRACE 11: GetEngine failed");
+        return nullptr;
+    }
+
+    // BmSDK Generated/Engine/_Engine.g.cs:
+    // ObjectProperty GameViewport @ +700.
+    void* viewport = Read<void*>(engine, 700);
+    if (!viewport) {
+        Log(L"TRACE 13: Engine.GameViewport null");
+        return nullptr;
+    }
+
+    Log(L"TRACE 13: FindPlayerByControllerId begin");
+
+    // BmSDK generated wrapper:
+    // params size 16, ControllerId @ +0, return LocalPlayer @ +4.
+    alignas(8) uint8_t params[16]{};
+    const int controllerId = 0;
+    memcpy(params + 0, &controllerId, sizeof(controllerId));
+
+    if (!ProcessEvent(viewport, g_fnFindPlayerByControllerId, params)) {
+        Log(L"TRACE 13: FindPlayerByControllerId failed");
+        return nullptr;
+    }
+
+    void* localPlayer = nullptr;
+    memcpy(&localPlayer, params + 4, sizeof(void*));
+    if (!localPlayer) {
+        Log(L"TRACE 14: LocalPlayer null");
+        return nullptr;
+    }
+
+    // BmSDK Generated/Engine/Player.g.cs:
+    // ObjectProperty Actor @ +92.
+    void* pc = Read<void*>(localPlayer, 92);
+    if (!pc) {
+        Log(L"TRACE 14: LocalPlayer.Actor null");
+        return nullptr;
+    }
+
+    wchar_t msg[256]{};
+    swprintf_s(msg,
+        L"TRACE 14: Engine=0x%llX Viewport=0x%llX LocalPlayer=0x%llX PC=0x%llX",
+        (unsigned long long)engine,
+        (unsigned long long)viewport,
+        (unsigned long long)localPlayer,
+        (unsigned long long)pc);
+    Log(msg);
+
+    return pc;
+}
+
+
+bool GetRenderedCameraFromCache(Vec3& location, RotatorRaw& rotation, float& fov) {
+    Log(L"CAM 00: CameraCache read begin");
+    void* pc = GetPlayerController_BmSDKPath();
+    if (!pc) { Log(L"CAM 01 FAIL: no PlayerController"); return false; }
+
+    void* camera = Read<void*>(pc, kPlayerControllerPlayerCamera);
+    if (!camera || !IsReadableAddress(reinterpret_cast<uint8_t*>(camera)+kCameraCache+kCameraCachePOV, 28)) {
+        Log(L"CAM 02 FAIL: PlayerCamera/CameraCache invalid");
+        return false;
+    }
+
+    const ptrdiff_t pov = kCameraCache + kCameraCachePOV;
+    location = Read<Vec3>(camera, pov + 0x00);
+    rotation = Read<RotatorRaw>(camera, pov + 0x0C);
+    fov = Read<float>(camera, pov + 0x18);
+
+    wchar_t msg[256]{};
+    swprintf_s(msg,L"CAM 03: PlayerCamera=0x%llX XYZ %.2f %.2f %.2f rot %d %d %d FOV %.2f",
+        (unsigned long long)camera, location.x, location.y, location.z,
+        rotation.pitch, rotation.yaw, rotation.roll, fov);
+    Log(msg);
+
+    return std::isfinite(location.x)&&std::isfinite(location.y)&&std::isfinite(location.z)&&std::isfinite(fov);
+}
+
+bool GetPlayerView(Vec3& location, RotatorRaw& rotation) {
+    Log(L"TRACE 10: GetPlayerView begin");
+
+    // Do NOT scan the 785000-entry GObjObjects array.
+    // Match BmSDK exactly:
+    // GetEngine -> GameViewport -> FindPlayerByControllerId(0) -> LocalPlayer.Actor.
+    void* pc = GetPlayerController_BmSDKPath();
+    if (!pc || !g_fnGetPlayerViewPoint) {
+        Log(L"TRACE 15: PlayerController/GetPlayerViewPoint unavailable");
+        return false;
+    }
+
+    g_lastPlayerController = pc;
+
+    Log(L"TRACE 15: GetPlayerViewPoint ProcessEvent begin");
+    alignas(8) uint8_t params[32]{};
+
+    if (!ProcessEvent(pc, g_fnGetPlayerViewPoint, params)) {
+        Log(L"TRACE 15: GetPlayerViewPoint failed");
+        return false;
+    }
+
+    memcpy(&location, params + 0, sizeof(location));
+    memcpy(&rotation, params + 12, sizeof(rotation));
+
+    wchar_t msg[192]{};
+    swprintf_s(msg, L"TRACE 16: View OK %.2f %.2f %.2f rot %d %d %d",
+        location.x, location.y, location.z,
+        rotation.pitch, rotation.yaw, rotation.roll);
+    Log(msg);
+
+    return std::isfinite(location.x) &&
+           std::isfinite(location.y) &&
+           std::isfinite(location.z);
+}
+
+void* GetWorldInfo_BmSDKPath() {
+    // 1:1 transliteration of generated Engine.WorldInfo.GetWorldInfo():
+    // - resolve Engine.WorldInfo.GetWorldInfo
+    // - get Engine.WorldInfo class default object
+    // - temporarily clear FUNC_Native, set FUNC_Defined, iNative = 0
+    // - ProcessEvent(CDO,...)
+    // - restore UFunction fields
+    // - return params + 0
+    if (!g_classWorldInfo || !g_fnWorldInfoGetWorldInfo || !g_getDefaultObject || !g_processEvent)
+        return nullptr;
+
+    void* cdo = nullptr;
+    __try {
+        cdo = g_getDefaultObject(g_classWorldInfo, 0);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        Log(L"BatLit BmSDKPath: GetDefaultObject(WorldInfo) raised an exception");
+        return nullptr;
+    }
+
+    if (!cdo) {
+        Log(L"BatLit BmSDKPath: WorldInfo CDO is null");
+        return nullptr;
+    }
+
+    alignas(8) uint8_t params[8]{};
+
+    if (!IsReadableAddress(reinterpret_cast<uint8_t*>(g_fnWorldInfoGetWorldInfo) + kUFunctionNativeIndex, sizeof(uint16_t))) {
+        Log(L"BatLit BmSDKPath: WorldInfo.GetWorldInfo UFunction layout unreadable");
+        return nullptr;
+    }
+
+    auto* flags = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(g_fnWorldInfoGetWorldInfo) + kUFunctionFlags);
+    auto* nativeIndex = reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(g_fnWorldInfoGetWorldInfo) + kUFunctionNativeIndex);
+
+    uint32_t oldFlags{};
+    uint16_t oldNative{};
+
+    __try {
+        oldFlags = *flags;
+        oldNative = *nativeIndex;
+
+        *flags = (oldFlags & ~kFUNC_Native) | kFUNC_Defined;
+        *nativeIndex = 0;
+
+        g_processEvent(cdo, g_fnWorldInfoGetWorldInfo, params, nullptr);
+
+        *nativeIndex = oldNative;
+        *flags = oldFlags;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        __try {
+            *nativeIndex = oldNative;
+            *flags = oldFlags;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        Log(L"BatLit BmSDKPath: WorldInfo.GetWorldInfo ProcessEvent raised an exception");
+        return nullptr;
+    }
+
+    void* wi = nullptr;
+    memcpy(&wi, params + 0, sizeof(void*));
+    return wi;
+}
+
+void* GetActiveWorld() {
+    // Exact BmSDK Game.SpawnActorInternal world path:
+    //   var world = (World)GetWorldInfo().Outer.Outer;
+    void* wi = GetWorldInfo_BmSDKPath();
+    if (!wi) {
+        Log(L"BatLit BmSDKPath: GetWorldInfo() returned null");
+        return nullptr;
+    }
+
+    void* outer1 = Read<void*>(wi, kUObjectOuter);
+    if (!outer1) {
+        Log(L"BatLit BmSDKPath: GetWorldInfo().Outer is null");
+        return nullptr;
+    }
+
+    void* world = Read<void*>(outer1, kUObjectOuter);
+    if (!world) {
+        Log(L"BatLit BmSDKPath: GetWorldInfo().Outer.Outer is null");
+        return nullptr;
+    }
+
+    wchar_t msg[160]{};
+    swprintf_s(msg, L"BatLit BmSDKPath: WorldInfo=0x%llX World=0x%llX",
+               (unsigned long long)wi, (unsigned long long)world);
+    Log(msg);
+    return world;
+}
+
+struct LightState {
+    bool enabled{true};
+    float color[3]{1.0f,1.0f,1.0f};
+    float intensity{1.0f};
+    float lightBulbRadius{};
+    float radiosity{};
+    float radiosityDiffuse{};
+    float shadowUpdatePriority{};
+    float cullAreaMultiplier{};
+    float layer0Multiplier{};
+    float layer1Multiplier{};
+    float layer01Multiplier{};
+    float signalSmoothingHigh{};
+    float signalSmoothingLow{};
+    float effectorIntensity{};
+    float effectorColor[3]{1.0f,1.0f,1.0f};
+
+    bool umbraDoNotCull{};
+    bool radiosityOnly{};
+    bool castShadows{};
+    bool castStaticShadows{};
+    bool castDynamicShadows{};
+    bool castCompositeShadow{};
+    bool affectCompositeShadowDirection{};
+    bool nonModulatedSelfShadowing{};
+    bool selfShadowOnly{};
+    bool allowPreShadow{};
+    bool forceDynamicLight{};
+    bool useDirectLightMap{};
+    bool affectDynamicOutsideChannel{};
+    bool renderLightShafts{};
+    bool drawAsVolume{};
+    bool dontAffectLightVolume{};
+    bool dontAffectForwardLitTransparencies{};
+    bool forceDynamicShadows{};
+    bool cheapLight{};
+    bool ambientOnly{};
+    bool xray{};
+    bool alsoXray{};
+    bool notInCinematics{};
+    bool lod2Fade{};
+    bool explicitlyAssigned{};
+    bool allowCompositingIntoDLE{};
+    bool cinematicLightType{};
+
+    bool channelInitialized{};
+    bool channelBSP{};
+    bool channelStatic{};
+    bool channelDynamic{};
+    bool channelCompositeDynamic{};
+    bool channelSkybox{};
+
+    int lightAffectsClassification{};
+    int shadowProjectionTechnique{};
+    int shadowFilterQuality{};
+    int depthPriorityGroup{};
+    float coreSize{};
+    float omniFadeRadiusFactor{};
+    float occlusionDepthRange{};
+    float bloomScale{};
+    float bloomThreshold{};
+    float bloomScreenBlendThreshold{};
+    float bloomTint[3]{1.0f,1.0f,1.0f};
+    float radialBlurPercent{};
+    float occlusionMaskDarkness{};
+    float shadowResolutionMultiplier{};
+
+    float shadowRadiusMultiplier{};
+    float radius{};
+    float falloffExponent{};
+    float shadowFalloffExponent{};
+    float minShadowFalloffRadius{};
+    bool quadraticFalloff{};
+    Vec3 translation{};
+
+    float innerConeAngle{};
+    float outerConeAngle{};
+    float lightShaftConeAngle{};
+    float pitch{}, yaw{}, roll{};
+    bool absoluteRotation{};
+    bool nvidiaLightShafts{};
+    bool castOpacityShadows{};
+    int qualityLevel{};
+    int phaseFunction{};
+    float distanceScale{};
+    float gelThreshold{};
+    float scatter{};
+    float absorption{};
+    float phase{};
+    float shaftIntensity{};
+    float opacityShadowNearDepth{};
+    float opacityShadowOpacityMultiplier{};
+    float opacityShadowAmbientSelf{};
+    float opacityShadowAmbientProjected{};
+};
+
+struct LightRecord {
+    uint32_t id{};
+    bool isSpot{};
+    int ordinal{};
+    void* actor{};
+    void* component{};
+    void* spawnWorld{};
+    void* spawnWorldInfo{};
+    std::string name;
+    bool editOpen{};
+    bool editorLoggedOpen{};
+    bool gizmoVisible{true};
+    bool valid{};
+    bool statePending{};
+    int stateRetryTicks{};
+    LightState state{};
+    LightState defaults{};
+};
+
+std::vector<LightRecord> g_lights;
+std::mutex g_lightMutex;
+uint32_t g_nextLightId = 1;
+int g_nextSpotOrdinal = 1;
+int g_nextPointOrdinal = 1;
+
+enum class CommandType { SpawnSpot, SpawnPoint, Apply, Reset, MoveToCamera, ToggleEnabled };
+struct Command { CommandType type; uint32_t id{}; bool boolValue{}; };
+std::vector<Command> g_commands;
+std::mutex g_commandMutex;
+
+bool GetActiveWorldSnapshotQuiet(void*& outWorldInfo, void*& outWorld) {
+    outWorldInfo = nullptr;
+    outWorld = nullptr;
+
+    void* wi = GetWorldInfo_BmSDKPath();
+    if (!wi || !IsReadableAddress(reinterpret_cast<uint8_t*>(wi) + kUObjectOuter, sizeof(void*)))
+        return false;
+
+    void* outer1 = Read<void*>(wi, kUObjectOuter);
+    if (!outer1 || !IsReadableAddress(reinterpret_cast<uint8_t*>(outer1) + kUObjectOuter, sizeof(void*)))
+        return false;
+
+    void* world = Read<void*>(outer1, kUObjectOuter);
+    if (!world) return false;
+
+    outWorldInfo = wi;
+    outWorld = world;
+    return true;
+}
+
+void* g_trackedWorld = nullptr;
+void* g_trackedWorldInfo = nullptr;
+uint32_t g_worldCheckCounter = 0;
+
+bool DestroyTrackedLightActor(LightRecord& rec) {
+    if (!rec.actor || !IsReadableAddress(rec.actor, 0xE0))
+        return false;
+
+    if (!g_fnActorDestroy)
+        return false;
+
+    // Engine.Actor.Destroy() returns a bool, but the return value is irrelevant here.
+    // A small zeroed buffer is sufficient for the reflected call.
+    alignas(8) uint8_t params[8]{};
+    return ProcessScriptEvent(rec.actor, g_fnActorDestroy, params);
+}
+
+void CheckForLevelRestartAndCleanupLights() {
+    // Keep this deliberately cheap: only inspect World/WorldInfo twice per second
+    // at ~60 FPS. This avoids undoing the closed-UI FPS fix.
+    if (++g_worldCheckCounter < 30)
+        return;
+    g_worldCheckCounter = 0;
+
+    void* wi = nullptr;
+    void* world = nullptr;
+    if (!GetActiveWorldSnapshotQuiet(wi, world))
+        return;
+
+    if (!g_trackedWorld && !g_trackedWorldInfo) {
+        g_trackedWorld = world;
+        g_trackedWorldInfo = wi;
+        return;
+    }
+
+    // RestartLevel / map reload can change WorldInfo even when the surrounding
+    // world hierarchy is reused, so compare BOTH pointers.
+    if (world == g_trackedWorld && wi == g_trackedWorldInfo)
+        return;
+
+    {
+        wchar_t msg[256]{};
+        swprintf_s(msg,
+            L"BatLit: level/world changed (WI 0x%llX -> 0x%llX, World 0x%llX -> 0x%llX). Removing spawned lights.",
+            (unsigned long long)g_trackedWorldInfo,
+            (unsigned long long)wi,
+            (unsigned long long)g_trackedWorld,
+            (unsigned long long)world);
+        Log(msg);
+    }
+
+    int destroyed = 0;
+    int tracked = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_lightMutex);
+        tracked = static_cast<int>(g_lights.size());
+
+        // Destroy the spawned actors if UE3 still exposes them. If the old level
+        // already destroyed one, simply drop the stale record.
+        for (auto& rec : g_lights) {
+            if (DestroyTrackedLightActor(rec))
+                ++destroyed;
+            rec.valid = false;
+        }
+
+        g_lights.clear();
+        g_nextLightId = 1;
+        g_nextSpotOrdinal = 1;
+        g_nextPointOrdinal = 1;
+    }
+
+    // Never let a gizmo continue referencing a light from the old level.
+    g_gizmoLightId = 0;
+
+    // Discard commands that were queued for old light IDs.
+    {
+        std::lock_guard<std::mutex> lock(g_commandMutex);
+        g_commands.clear();
+    }
+
+    g_trackedWorld = world;
+    g_trackedWorldInfo = wi;
+
+    wchar_t msg[192]{};
+    swprintf_s(msg, L"BatLit: level cleanup complete. tracked=%d destroyed=%d", tracked, destroyed);
+    Log(msg);
+}
+
+
+void Queue(CommandType type, uint32_t id = 0, bool value = false) {
+    std::lock_guard<std::mutex> lock(g_commandMutex);
+    g_commands.push_back({type,id,value});
+}
+
+void LogLightRecord(const wchar_t* tag, const LightRecord& rec) {
+    wchar_t msg[512]{};
+    swprintf_s(msg, L"[BatLitDiag] %s id=%u name=%S actor=0x%llX component=0x%llX valid=%d pending=%d retry=%d edit=%d intensity=%.3f radius=%.3f enabled=%d",
+        tag ? tag : L"(null)",
+        rec.id, rec.name.c_str(),
+        (unsigned long long)rec.actor, (unsigned long long)rec.component,
+        rec.valid ? 1 : 0, rec.statePending ? 1 : 0, rec.stateRetryTicks, rec.editOpen ? 1 : 0,
+        rec.state.intensity, rec.state.radius, rec.state.enabled ? 1 : 0);
+    Log(msg);
+}
+
+uint8_t FloatToByte(float v) {
+    v = (std::max)(0.0f, (std::min)(1.0f, v));
+    return static_cast<uint8_t>(std::lround(v * 255.0f));
+}
+
+void ReadColor(void* component, ptrdiff_t off, float out[3]) {
+    const auto c = Read<ColorBGRA>(component, off);
+    out[0] = c.r / 255.0f; out[1] = c.g / 255.0f; out[2] = c.b / 255.0f;
+}
+void WriteColor(void* component, ptrdiff_t off, const float in[3]) {
+    auto c = Read<ColorBGRA>(component, off);
+    c.r = FloatToByte(in[0]); c.g = FloatToByte(in[1]); c.b = FloatToByte(in[2]); c.a = 255;
+    Write(component, off, c);
+}
+
+bool ReadState(LightRecord& rec, LightState& st) {
+    void* c = rec.component;
+    if (!c || !IsReadableAddress(c, rec.isSpot ? 0x334 : 0x2DC)) return false;
+    const uint32_t f = Read<uint32_t>(c, 0x220);
+    st.enabled = (f & 0x4) != 0;
+    ReadColor(c, 0x200, st.color);
+    st.intensity = Read<float>(c,0x1F0);
+    st.lightBulbRadius = Read<float>(c,0x1EC);
+    st.radiosity = Read<float>(c,0x1F4);
+    st.radiosityDiffuse = Read<float>(c,0x1F8);
+    st.shadowUpdatePriority = Read<float>(c,0x1FC);
+    st.cullAreaMultiplier = Read<float>(c,0x204);
+    st.layer0Multiplier = Read<float>(c,0x104);
+    st.layer1Multiplier = Read<float>(c,0x108);
+    st.layer01Multiplier = Read<float>(c,0x10C);
+    st.signalSmoothingHigh = Read<float>(c,0x1B0);
+    st.signalSmoothingLow = Read<float>(c,0x1B4);
+    st.effectorIntensity = Read<float>(c,0x1B8);
+    ReadColor(c,0x1BC,st.effectorColor);
+    st.umbraDoNotCull=(f&0x1)!=0; st.radiosityOnly=(f&0x2)!=0;
+    st.castShadows=(f&0x10)!=0; st.castStaticShadows=(f&0x20)!=0; st.castDynamicShadows=(f&0x40)!=0;
+    st.castCompositeShadow=(f&0x80)!=0; st.affectCompositeShadowDirection=(f&0x100)!=0;
+    st.nonModulatedSelfShadowing=(f&0x200)!=0; st.selfShadowOnly=(f&0x400)!=0; st.allowPreShadow=(f&0x800)!=0;
+    st.forceDynamicLight=(f&0x1000)!=0; st.useDirectLightMap=(f&0x2000)!=0;
+    st.affectDynamicOutsideChannel=(f&0x8000)!=0; st.renderLightShafts=(f&0x10000)!=0; st.drawAsVolume=(f&0x20000)!=0;
+    st.dontAffectLightVolume=(f&0x40000)!=0; st.dontAffectForwardLitTransparencies=(f&0x80000)!=0;
+    st.forceDynamicShadows=(f&0x100000)!=0; st.cheapLight=(f&0x200000)!=0; st.ambientOnly=(f&0x400000)!=0;
+    st.xray=(f&0x800000)!=0; st.alsoXray=(f&0x1000000)!=0; st.notInCinematics=(f&0x2000000)!=0;
+    st.lod2Fade=(f&0x4000000)!=0; st.explicitlyAssigned=(f&0x10000000)!=0; st.allowCompositingIntoDLE=(f&0x20000000)!=0; st.cinematicLightType=(f&0x40000000)!=0;
+    const uint32_t ch = Read<uint32_t>(c,0x224);
+    st.channelInitialized=(ch&1)!=0; st.channelBSP=(ch&2)!=0; st.channelStatic=(ch&4)!=0; st.channelDynamic=(ch&8)!=0; st.channelCompositeDynamic=(ch&16)!=0; st.channelSkybox=(ch&32)!=0;
+    st.lightAffectsClassification=Read<uint8_t>(c,0x228); st.shadowProjectionTechnique=Read<uint8_t>(c,0x230); st.shadowFilterQuality=Read<uint8_t>(c,0x231); st.depthPriorityGroup=Read<uint8_t>(c,0x232);
+    st.coreSize=Read<float>(c,0x234); st.omniFadeRadiusFactor=Read<float>(c,0x238); st.occlusionDepthRange=Read<float>(c,0x23C);
+    st.bloomScale=Read<float>(c,0x240); st.bloomThreshold=Read<float>(c,0x244); st.bloomScreenBlendThreshold=Read<float>(c,0x248); ReadColor(c,0x24C,st.bloomTint);
+    st.radialBlurPercent=Read<float>(c,0x250); st.occlusionMaskDarkness=Read<float>(c,0x254); st.shadowResolutionMultiplier=Read<float>(c,0x260);
+    st.shadowRadiusMultiplier=Read<float>(c,0x264); st.radius=Read<float>(c,0x268); st.falloffExponent=Read<float>(c,0x26C); st.shadowFalloffExponent=Read<float>(c,0x270); st.minShadowFalloffRadius=Read<float>(c,0x274); st.quadraticFalloff=(Read<uint32_t>(c,0x278)&1)!=0; st.translation=Read<Vec3>(c,0x2C0);
+    if (rec.isSpot) {
+        st.innerConeAngle=Read<float>(c,0x2DC); st.outerConeAngle=Read<float>(c,0x2E0); st.lightShaftConeAngle=Read<float>(c,0x2E4);
+        const RotatorRaw rr=Read<RotatorRaw>(c,0x2F8); st.pitch=RuuToDegrees(rr.pitch); st.yaw=RuuToDegrees(rr.yaw); st.roll=RuuToDegrees(rr.roll);
+        const uint32_t sf=Read<uint32_t>(c,0x304); st.absoluteRotation=(sf&1)!=0; st.nvidiaLightShafts=(sf&2)!=0; st.castOpacityShadows=(sf&4)!=0;
+        st.qualityLevel=Read<uint8_t>(c,0x308); st.phaseFunction=Read<uint8_t>(c,0x309);
+        st.distanceScale=Read<float>(c,0x30C); st.gelThreshold=Read<float>(c,0x310); st.scatter=Read<float>(c,0x314); st.absorption=Read<float>(c,0x318); st.phase=Read<float>(c,0x31C); st.shaftIntensity=Read<float>(c,0x320);
+        st.opacityShadowNearDepth=Read<float>(c,0x324); st.opacityShadowOpacityMultiplier=Read<float>(c,0x328); st.opacityShadowAmbientSelf=Read<float>(c,0x32C); st.opacityShadowAmbientProjected=Read<float>(c,0x330);
+    }
+    return true;
+}
+
+void SetBit(uint32_t& flags, uint32_t mask, bool value) { flags = value ? (flags|mask) : (flags&~mask); }
+
+bool SetEnabledImmediate(LightRecord& rec, bool enabled) {
+    void* c = rec.component;
+    if (!c || !IsReadableAddress(c, rec.isSpot ? 0x334 : 0x2DC)) {
+        rec.valid = false;
+        Log(L"[BatLitEnable] invalid component");
+        return false;
+    }
+
+    const uint32_t flagsBefore = Read<uint32_t>(c, 0x220);
+    const uint32_t compFlagsBefore = Read<uint32_t>(c, 0x40);
+    wchar_t before[384]{};
+    swprintf_s(before, L"[BatLitEnable] id=%u component=0x%llX request=%s Flags220(before)=%08X Flags40(before)=%08X fn=0x%llX",
+        rec.id, (unsigned long long)c, enabled ? L"ON" : L"OFF", flagsBefore, compFlagsBefore,
+        (unsigned long long)g_fnSetEnabled);
+    Log(before);
+
+    bool peOk = false;
+    if (g_fnSetEnabled) {
+        // IMPORTANT: do not pre-write bEnabled. SetEnabled() must see the state
+        // transition itself so UE3 can update/reattach the renderer-side light.
+        struct PEnable { int32_t b{}; } pe{enabled ? 1 : 0};
+        peOk = ProcessScriptEvent(c, g_fnSetEnabled, &pe);
+    } else {
+        // Fallback only if the UFunction could not be resolved.
+        uint32_t flags = flagsBefore;
+        SetBit(flags, 0x4, enabled);
+        Write(c, 0x220, flags);
+    }
+
+    const uint32_t flagsAfter = Read<uint32_t>(c, 0x220);
+    const uint32_t compFlagsAfter = Read<uint32_t>(c, 0x40);
+    wchar_t after[384]{};
+    swprintf_s(after, L"[BatLitEnable] ProcessEvent=%d Flags220(after)=%08X Flags40(after)=%08X enabledBit=%d",
+        peOk ? 1 : 0, flagsAfter, compFlagsAfter, (flagsAfter & 0x4) ? 1 : 0);
+    Log(after);
+
+    rec.state.enabled = enabled;
+    return g_fnSetEnabled ? peOk : true;
+}
+
+void ApplyState(LightRecord& rec, const LightState& st) {
+    LogLightRecord(L"ApplyState begin", rec);
+    { wchar_t msg[320]{}; swprintf_s(msg,L"[BatLitDiag] Apply target id=%u component=0x%llX desired intensity=%.3f radius=%.3f enabled=%d",rec.id,(unsigned long long)rec.component,st.intensity,st.radius,st.enabled?1:0); Log(msg); }
+    void* c=rec.component; if(!c || !IsReadableAddress(c, rec.isSpot?0x334:0x2DC)) { rec.valid=false; Log(L"[BatLitDiag] ApplyState abort: invalid component"); return; }
+    uint32_t f=Read<uint32_t>(c,0x220);
+    SetBit(f,0x1,st.umbraDoNotCull); SetBit(f,0x2,st.radiosityOnly); /* bEnabled is handled by LightComponent.SetEnabled() below */ SetBit(f,0x10,st.castShadows); SetBit(f,0x20,st.castStaticShadows); SetBit(f,0x40,st.castDynamicShadows); SetBit(f,0x80,st.castCompositeShadow); SetBit(f,0x100,st.affectCompositeShadowDirection); SetBit(f,0x200,st.nonModulatedSelfShadowing); SetBit(f,0x400,st.selfShadowOnly); SetBit(f,0x800,st.allowPreShadow); SetBit(f,0x1000,st.forceDynamicLight); SetBit(f,0x2000,st.useDirectLightMap); SetBit(f,0x8000,st.affectDynamicOutsideChannel); SetBit(f,0x10000,st.renderLightShafts); SetBit(f,0x20000,st.drawAsVolume); SetBit(f,0x40000,st.dontAffectLightVolume); SetBit(f,0x80000,st.dontAffectForwardLitTransparencies); SetBit(f,0x100000,st.forceDynamicShadows); SetBit(f,0x200000,st.cheapLight); SetBit(f,0x400000,st.ambientOnly); SetBit(f,0x800000,st.xray); SetBit(f,0x1000000,st.alsoXray); SetBit(f,0x2000000,st.notInCinematics); SetBit(f,0x4000000,st.lod2Fade); SetBit(f,0x10000000,st.explicitlyAssigned); SetBit(f,0x20000000,st.allowCompositingIntoDLE); SetBit(f,0x40000000,st.cinematicLightType); Write(c,0x220,f);
+    WriteColor(c,0x200,st.color); Write(c,0x1F0,st.intensity); Write(c,0x1EC,st.lightBulbRadius); Write(c,0x1F4,st.radiosity); Write(c,0x1F8,st.radiosityDiffuse); Write(c,0x1FC,st.shadowUpdatePriority); Write(c,0x204,st.cullAreaMultiplier);
+    Write(c,0x104,st.layer0Multiplier); Write(c,0x108,st.layer1Multiplier); Write(c,0x10C,st.layer01Multiplier); Write(c,0x1B0,st.signalSmoothingHigh); Write(c,0x1B4,st.signalSmoothingLow); Write(c,0x1B8,st.effectorIntensity); WriteColor(c,0x1BC,st.effectorColor);
+    uint32_t ch=Read<uint32_t>(c,0x224); SetBit(ch,1,st.channelInitialized); SetBit(ch,2,st.channelBSP); SetBit(ch,4,st.channelStatic); SetBit(ch,8,st.channelDynamic); SetBit(ch,16,st.channelCompositeDynamic); SetBit(ch,32,st.channelSkybox); Write(c,0x224,ch);
+    Write<uint8_t>(c,0x228,(uint8_t)std::clamp(st.lightAffectsClassification,0,6)); Write<uint8_t>(c,0x230,(uint8_t)std::clamp(st.shadowProjectionTechnique,0,5)); Write<uint8_t>(c,0x231,(uint8_t)std::clamp(st.shadowFilterQuality,0,2)); Write<uint8_t>(c,0x232,(uint8_t)std::clamp(st.depthPriorityGroup,0,255));
+    Write(c,0x234,st.coreSize); Write(c,0x238,st.omniFadeRadiusFactor); Write(c,0x23C,st.occlusionDepthRange); Write(c,0x240,st.bloomScale); Write(c,0x244,st.bloomThreshold); Write(c,0x248,st.bloomScreenBlendThreshold); WriteColor(c,0x24C,st.bloomTint); Write(c,0x250,st.radialBlurPercent); Write(c,0x254,st.occlusionMaskDarkness); Write(c,0x260,st.shadowResolutionMultiplier);
+    Write(c,0x264,st.shadowRadiusMultiplier); Write(c,0x268,st.radius); Write(c,0x26C,st.falloffExponent); Write(c,0x270,st.shadowFalloffExponent); Write(c,0x274,st.minShadowFalloffRadius); uint32_t pf=Read<uint32_t>(c,0x278); SetBit(pf,1,st.quadraticFalloff); Write(c,0x278,pf);
+
+    SetEnabledImmediate(rec, st.enabled);
+    uint8_t dummy{};
+    ProcessEvent(c,g_fnLightColor,&dummy); ProcessEvent(c,g_fnBrightness,&dummy); ProcessScriptEvent(c,g_fnUpdateColorBrightness,&dummy);
+
+    struct PTranslation { Vec3 v; } pt{st.translation}; ProcessScriptEvent(c,g_fnSetTranslation,&pt);
+    if(rec.isSpot) {
+        struct PAngle { float inner,outer,radius; } pa{st.innerConeAngle,st.outerConeAngle,st.radius}; ProcessScriptEvent(c,g_fnSetAngleRadius,&pa);
+        Write(c,0x2E4,st.lightShaftConeAngle);
+        const RotatorRaw rr{DegreesToRuu(st.pitch),DegreesToRuu(st.yaw),DegreesToRuu(st.roll)};
+        struct PRotation { RotatorRaw r; } pr{rr}; ProcessScriptEvent(c,g_fnSetRotation,&pr);
+        struct PAbs { int32_t b; } pab{st.absoluteRotation?1:0}; ProcessScriptEvent(c,g_fnSetAbsoluteRotation,&pab);
+        uint32_t sf=Read<uint32_t>(c,0x304); SetBit(sf,1,st.absoluteRotation); SetBit(sf,2,st.nvidiaLightShafts); SetBit(sf,4,st.castOpacityShadows); Write(c,0x304,sf);
+        Write<uint8_t>(c,0x308,(uint8_t)std::clamp(st.qualityLevel,0,3)); Write<uint8_t>(c,0x309,(uint8_t)std::clamp(st.phaseFunction,0,3));
+        Write(c,0x30C,st.distanceScale); Write(c,0x310,st.gelThreshold); Write(c,0x314,st.scatter); Write(c,0x318,st.absorption); Write(c,0x31C,st.phase); Write(c,0x320,st.shaftIntensity); Write(c,0x324,st.opacityShadowNearDepth); Write(c,0x328,st.opacityShadowOpacityMultiplier); Write(c,0x32C,st.opacityShadowAmbientSelf); Write(c,0x330,st.opacityShadowAmbientProjected); ProcessScriptEvent(c,g_fnUpdateShafts,&dummy);
+    }
+}
+
+LightRecord* FindRecord(uint32_t id) {
+    for(auto& r:g_lights) if(r.id==id) return &r; return nullptr;
+}
+
+void* SafeSpawnActor_BmSDKPath(void* world, void* cls, FNameRaw name, Vec3* loc, RotatorRaw* rot) {
+    if (!g_spawnActor) return nullptr;
+
+    Log(L"BatLit BmSDKPath: entering UWorld::SpawnActor");
+    void* result = nullptr;
+
+    __try {
+        // 1:1 with BmSDK Framework.Game.SpawnActorInternal:
+        // world.Ptr, Class.Ptr, Name, &Location, &Rotation,
+        // Template=0, bNoCollisionFail=1, bRemoteOwned=0,
+        // Owner=0, Instigator=0, bNoFail=1, OverrideLevel=0
+        result = g_spawnActor(
+            world,
+            cls,
+            name,
+            loc,
+            rot,
+            nullptr,
+            1,
+            0,
+            nullptr,
+            nullptr,
+            1,
+            nullptr
+        );
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        Log(L"BatLit BmSDKPath: UWorld::SpawnActor raised an exception");
+        return nullptr;
+    }
+
+    Log(result ? L"BatLit BmSDKPath: UWorld::SpawnActor returned actor"
+               : L"BatLit BmSDKPath: UWorld::SpawnActor returned null");
+    return result;
+}
+
+bool Spawn(bool spot) {
+    Log(spot ? L"[BatLitDiag] Spawn begin type=Spot" : L"[BatLitDiag] Spawn begin type=Point");
+    Log(spot ? L"BatLit BmSDKPath: Create Spot request" : L"BatLit BmSDKPath: Create Point request");
+
+    Vec3 loc{}; RotatorRaw rot{};
+    if(!GetPlayerView(loc,rot)) { Log(L"BatLit BmSDKPath: player view not found"); return false; }
+
+    {
+        wchar_t msg[192]{};
+        swprintf_s(msg, L"BatLit BmSDKPath: camera %.2f %.2f %.2f rot %d %d %d",
+                   loc.x, loc.y, loc.z, rot.pitch, rot.yaw, rot.roll);
+        Log(msg);
+    }
+
+    void* world=GetActiveWorld(); void* cls=spot?g_classSpotLightMovable:g_classPointLightMovable;
+    if(!world||!cls||!g_spawnActor) { Log(L"BatLit: world/class/spawn unavailable"); return false; }
+
+    if (!g_trackedWorld) {
+        g_trackedWorld = world;
+        g_trackedWorldInfo = GetWorldInfo_BmSDKPath();
+    }
+    FNameRaw none{}; void* actor=SafeSpawnActor_BmSDKPath(world,cls,none,&loc,&rot);
+    if(!actor||!IsReadableAddress(reinterpret_cast<uint8_t*>(actor)+kLightActorComponent,sizeof(void*))) { Log(L"BatLit: SpawnActor failed"); return false; }
+    void* component=Read<void*>(actor,kLightActorComponent);
+    { wchar_t msg[256]{}; swprintf_s(msg,L"[BatLitDiag] Spawn result actor=0x%llX component=0x%llX",(unsigned long long)actor,(unsigned long long)component); Log(msg); }
+    if(!component) { Log(L"BatLit: spawned actor has no LightComponent"); return false; }
+    LightRecord rec{}; rec.id=g_nextLightId++; rec.isSpot=spot; rec.ordinal=spot?g_nextSpotOrdinal++:g_nextPointOrdinal++; rec.actor=actor; rec.component=component; rec.spawnWorld=world; rec.spawnWorldInfo=GetWorldInfo_BmSDKPath(); rec.name=(spot?"Spot ":"Point ")+std::to_string(rec.ordinal); rec.valid=true;
+
+    // The first spawned light can exist before its component is fully ready for
+    // our full state snapshot. Do not throw the record away in that case.
+    // Add it immediately, then retry ReadState from later engine ticks.
+    if (ReadState(rec, rec.defaults)) {
+        rec.state = rec.defaults;
+        rec.statePending = false;
+        rec.stateRetryTicks = 0;
+        Log(L"BatLit SAFE: initial state captured on spawn tick");
+    } else {
+        rec.statePending = true;
+        rec.stateRetryTicks = 0;
+        Log(L"BatLit SAFE: light spawned; state capture deferred to later ticks");
+    }
+
+    g_lights.push_back(rec);
+    LogLightRecord(L"record pushed", g_lights.back());
+    wchar_t msg[192]{}; swprintf_s(msg,L"BatLit: spawned %s %d actor=0x%llX component=0x%llX%s",spot?L"Spot":L"Point",rec.ordinal,(unsigned long long)actor,(unsigned long long)component,rec.statePending?L" [state pending]":L""); Log(msg);
+    return true;
+}
+
+void UpdatePendingLightRecords() {
+    std::lock_guard<std::mutex> lock(g_lightMutex);
+    for (auto& rec : g_lights) {
+        if (!rec.valid || !rec.statePending) continue;
+
+        // Give the newly spawned UE3 component a tick before the first retry,
+        // then retry for a short bounded window without sleeping the game thread.
+        if (rec.stateRetryTicks++ == 0) continue;
+
+        LightState captured{};
+        { wchar_t msg[256]{}; swprintf_s(msg,L"[BatLitDiag] retry ReadState id=%u tick=%d component=0x%llX",rec.id,rec.stateRetryTicks,(unsigned long long)rec.component); Log(msg); }
+        if (ReadState(rec, captured)) {
+            rec.defaults = captured;
+            rec.state = captured;
+            rec.statePending = false;
+            LogLightRecord(L"deferred ReadState ready", rec);
+
+            wchar_t msg[160]{};
+            swprintf_s(msg, L"BatLit: deferred state capture ready for %s %d after %d tick(s)",
+                       rec.isSpot ? L"Spot" : L"Point", rec.ordinal, rec.stateRetryTicks);
+            Log(msg);
+            continue;
+        }
+
+        if (rec.stateRetryTicks >= 10) {
+            // Keep the light record/edit window alive. The user can still move it
+            // and a later explicit action can refresh state; just stop hammering it.
+            rec.statePending = false;
+            Log(L"BatLit: deferred state capture timed out; keeping spawned light record");
+        }
+    }
+}
+
+void MoveRecordToCamera(LightRecord& rec) {
+    wchar_t hdr[192]{};
+    swprintf_s(hdr, L"MOVE 00: %s %d request actor=0x%llX component=0x%llX",
+               rec.isSpot ? L"Spot" : L"Point",
+               rec.ordinal,
+               (unsigned long long)rec.actor,
+               (unsigned long long)rec.component);
+    Log(hdr);
+
+    if (!rec.component || !IsReadableAddress(rec.component, rec.isSpot ? 0x334 : 0x2DC)) {
+        Log(L"MOVE 01 FAIL: component invalid/unreadable");
+        rec.valid = false;
+        return;
+    }
+
+    Vec3 loc{};
+    RotatorRaw rot{};
+    float fov = 0.0f;
+    bool fromCache = GetRenderedCameraFromCache(loc, rot, fov);
+    if (!fromCache) {
+        Log(L"MOVE 02: CameraCache unavailable, fallback GetPlayerViewPoint");
+        if (!GetPlayerView(loc, rot)) {
+            Log(L"MOVE 03 FAIL: no camera transform");
+            return;
+        }
+    }
+
+    {
+        wchar_t msg[256]{};
+        swprintf_s(msg, L"MOVE 10: SOURCE=%s XYZ %.2f %.2f %.2f rot %d %d %d FOV %.2f",
+                   fromCache ? L"CameraCache" : L"GetPlayerViewPoint",
+                   loc.x, loc.y, loc.z, rot.pitch, rot.yaw, rot.roll, fov);
+        Log(msg);
+    }
+
+    {
+        Vec3 viewLoc{}; RotatorRaw viewRot{};
+        if (GetPlayerView(viewLoc, viewRot)) {
+            wchar_t msg[320]{};
+            swprintf_s(msg, L"CAM CMP: cache-vs-view delta %.2f %.2f %.2f | cache rot %d %d %d | view rot %d %d %d",
+                loc.x-viewLoc.x, loc.y-viewLoc.y, loc.z-viewLoc.z,
+                rot.pitch,rot.yaw,rot.roll,viewRot.pitch,viewRot.yaw,viewRot.roll);
+            Log(msg);
+        }
+    }
+
+    // IMPORTANT: PointLightComponent.SetTranslation() is component-relative.
+    // Move the spawned Light Actor itself to the camera world transform.
+    struct PActorLocation {
+        Vec3 newLocation;
+        uint32_t returnValue;
+    } pl{};
+    pl.newLocation = loc;
+
+    Log(L"MOVE 20: Actor.SetLocation begin");
+    const bool moved = ProcessScriptEvent(rec.actor, g_fnActorSetLocation, &pl);
+    Log(moved ? L"MOVE 21: Actor.SetLocation returned"
+              : L"MOVE 21 FAIL: Actor.SetLocation ProcessEvent failed");
+
+    struct PActorRotation {
+        RotatorRaw newRotation;
+        uint32_t returnValue;
+    } pr{};
+    pr.newRotation = rot;
+
+    Log(L"MOVE 30: Actor.SetRotation begin");
+    const bool rotated = ProcessScriptEvent(rec.actor, g_fnActorSetRotation, &pr);
+    Log(rotated ? L"MOVE 31: Actor.SetRotation returned"
+                : L"MOVE 31 FAIL: Actor.SetRotation ProcessEvent failed");
+
+    const Vec3 actorPos = Read<Vec3>(rec.actor, kActorLocation);
+    const RotatorRaw actorRot = Read<RotatorRaw>(rec.actor, kActorRotation);
+    {
+        wchar_t msg[256]{};
+        swprintf_s(msg, L"MOVE 40: actor XYZ after %.2f %.2f %.2f | SetLocation ret=%u",
+                   actorPos.x, actorPos.y, actorPos.z, pl.returnValue);
+        Log(msg);
+    }
+    {
+        wchar_t msg[256]{};
+        swprintf_s(msg, L"MOVE 41: actor rot after %d %d %d | SetRotation ret=%u",
+                   actorRot.pitch, actorRot.yaw, actorRot.roll, pr.returnValue);
+        Log(msg);
+    }
+
+    if (ReadState(rec, rec.state))
+        Log(L"MOVE 50: state refreshed");
+    else
+        Log(L"MOVE 50 FAIL: state refresh failed");
+
+    Log(L"MOVE 60: complete");
+}
+
+void ExecuteCommands() {
+    std::vector<Command> cmds; { std::lock_guard<std::mutex> lock(g_commandMutex); cmds.swap(g_commands); }
+    if(cmds.empty()) return;
+    std::lock_guard<std::mutex> lock(g_lightMutex);
+    for(const auto& cmd:cmds) {
+        if(cmd.type==CommandType::SpawnSpot){Spawn(true);continue;} if(cmd.type==CommandType::SpawnPoint){Spawn(false);continue;}
+        LightRecord* rec=FindRecord(cmd.id); if(!rec) continue;
+        if(cmd.type==CommandType::Apply) ApplyState(*rec,rec->state);
+        else if(cmd.type==CommandType::Reset){rec->state=rec->defaults;ApplyState(*rec,rec->state);ReadState(*rec,rec->state);}
+        else if(cmd.type==CommandType::MoveToCamera){MoveRecordToCamera(*rec);}
+        else if(cmd.type==CommandType::ToggleEnabled){rec->state.enabled=cmd.boolValue;ApplyState(*rec,rec->state);}
+    }
+}
+
+bool HasPendingCommands() {
+    std::lock_guard<std::mutex> lock(g_commandMutex);
+    return !g_commands.empty();
+}
+
+void QueueConsoleCommand(const wchar_t* cmd) {
+    if (!cmd || !*cmd) return;
+    std::lock_guard<std::mutex> lock(g_consoleCommandMutex);
+    g_consoleCommandQueue.emplace_back(cmd);
+}
+
+void ProcessQueuedConsoleCommandsOnGameThread() {
+    if (!g_fnConsoleCommand) return;
+    std::vector<std::wstring> pending;
+    {
+        std::lock_guard<std::mutex> lock(g_consoleCommandMutex);
+        if (g_consoleCommandQueue.empty()) return;
+        pending.swap(g_consoleCommandQueue);
+    }
+    void* pc = GetPlayerController_BmSDKPath();
+    if (!pc) { Log(L"ConsoleCommand queue: no live PlayerController"); return; }
+    struct UE3FStringParam { wchar_t* Data{}; int32_t Count{}; int32_t Max{}; };
+    struct ConsoleCommandParams { UE3FStringParam Command{}; uint32_t bWriteToLog{}; UE3FStringParam ReturnValue{}; };
+    for (auto& command : pending) {
+        ConsoleCommandParams params{};
+        params.Command.Data = command.data();
+        params.Command.Count = static_cast<int32_t>(command.size()) + 1;
+        params.Command.Max = params.Command.Count;
+        ProcessEvent(pc, g_fnConsoleCommand, &params);
+        wchar_t msg[512]{}; swprintf_s(msg, L"ConsoleCommand -> %s", command.c_str()); Log(msg);
+    }
+}
+
+bool SetLightningLifetimeOnGameThread(void* lifetimeModule, float seconds) {
+    using namespace BatLitNative;
+    if (!lifetimeModule || !std::isfinite(seconds) || seconds <= 0.0f) return false;
+
+    // ParticleModuleLifetime.Lifetime is a RawDistributionFloat at +0x60 on
+    // this pinned build. The baked lookup TArray layout was runtime-validated:
+    // +04 Data (ptr), +0C Count, +10 Max. Normal and vertical each contain six
+    // floats (originally 0.8/1.0 repeated three times).
+    auto* raw = reinterpret_cast<uint8_t*>(lifetimeModule) + kParticleLifetimeRawDistribution;
+    if (!IsReadableAddress(raw, 0x1C)) return false;
+    float* data = Read<float*>(raw, 0x04);
+    const int32_t count = Read<int32_t>(raw, 0x0C);
+    if (!data || count <= 0 || count > 64 || !IsReadableAddress(data, static_cast<size_t>(count) * sizeof(float))) return false;
+
+    for (int32_t i = 0; i < count; ++i) data[i] = seconds;
+    return true;
+}
+
+bool SetLightningInstancesOnGameThread(void* spawnModule, int instances, int* outBurstEntries = nullptr) {
+    using namespace BatLitNative;
+    if (outBurstEntries) *outBurstEntries = 0;
+    if (!spawnModule) return false;
+    if (instances < 1) instances = 1;
+    if (instances > 32) instances = 32;
+
+    // Instead of trying to create extra ParticleSystemComponents (the pooled PSCs
+    // we tested were not renderer-registered), increase the existing lightning
+    // emitter's ParticleBurst.Count / CountLow. This creates multiple real
+    // lightning particles from the already registered natural PSC in one trigger.
+    void* burstListProp = GObjectAtFixedIndex(kGObj_ParticleModuleSpawn_BurstList);
+    void* timeProp = GObjectAtFixedIndex(kGObj_ParticleBurst_Time);
+    void* countLowProp = GObjectAtFixedIndex(kGObj_ParticleBurst_CountLow);
+    void* countProp = GObjectAtFixedIndex(kGObj_ParticleBurst_Count);
+    if (!burstListProp || !timeProp || !countLowProp || !countProp) return false;
+
+    const uint16_t burstListOff = Read<uint16_t>(burstListProp, 0x6A);
+    const uint16_t timeOff = Read<uint16_t>(timeProp, 0x6A);
+    const uint16_t countLowOff = Read<uint16_t>(countLowProp, 0x6A);
+    const uint16_t countOff = Read<uint16_t>(countProp, 0x6A);
+    if (burstListOff == 0 || countLowOff > 0x40 || countOff > 0x40 || timeOff > 0x40) return false;
+
+    auto* arr = reinterpret_cast<uint8_t*>(spawnModule) + burstListOff;
+    if (!IsReadableAddress(arr, 0x10)) return false;
+    uint8_t* data = Read<uint8_t*>(arr, 0x00);
+    const int32_t count = Read<int32_t>(arr, 0x08);
+    const int32_t maxCount = Read<int32_t>(arr, 0x0C);
+    if (!data || count <= 0 || count > 64 || maxCount < count) return false;
+
+    // ParticleBurst contains Time(float), CountLow(int), Count(int). Derive its
+    // stride from the reflected member offsets rather than pinning a guessed 12.
+    size_t stride = 0;
+    stride = (std::max)(stride, static_cast<size_t>(timeOff) + sizeof(float));
+    stride = (std::max)(stride, static_cast<size_t>(countLowOff) + sizeof(int32_t));
+    stride = (std::max)(stride, static_cast<size_t>(countOff) + sizeof(int32_t));
+    stride = (stride + 3u) & ~size_t(3u);
+    if (stride < 8 || stride > 0x40 || !IsReadableAddress(data, stride * static_cast<size_t>(count))) return false;
+
+    for (int32_t i = 0; i < count; ++i) {
+        uint8_t* burst = data + stride * static_cast<size_t>(i);
+        *reinterpret_cast<int32_t*>(burst + countLowOff) = instances;
+        *reinterpret_cast<int32_t*>(burst + countOff) = instances;
+    }
+    if (outBurstEntries) *outBurstEntries = count;
+    return true;
+}
+
+bool ResolveNaturalLightningPSCs() {
+    using namespace BatLitNative;
+
+    // IMPORTANT: this is intentionally FAST-ONLY. Never scan GObjects here:
+    // this function runs from HookEngineTick on the game thread when the user
+    // presses Trigger. Scanning ~650k objects here stalls Arkham Knight.
+    if (!g_lightningCacheReady.load(std::memory_order_acquire)) return false;
+
+    auto pscValid = [](void* psc) -> bool {
+        if (!psc || !IsReadableAddress(psc, 0x2A0)) return false;
+        if (!IsReadableAddress(reinterpret_cast<uint8_t*>(psc) + 0x9C, sizeof(void*))) return false;
+        return Read<void*>(psc, 0x9C) != nullptr;
+    };
+
+    if (!g_lightningActorCache || !IsReadableAddress(g_lightningActorCache, 0x2C0) ||
+        !pscValid(g_normalLightningPSCCache) || !pscValid(g_verticalLightningPSCCache)) {
+        g_lightningCacheReady.store(false, std::memory_order_release);
+        return false;
+    }
+    return true;
+}
+
+void RefreshNaturalLightningPSCsWorker() {
+    using namespace BatLitNative;
+    if (g_lightningCacheReady.load(std::memory_order_acquire)) return;
+    if (!g_classRLightningActor) return;
+
+    // Slow GObjects scan is allowed ONLY from the background worker thread.
+    void* actor = FindLiveObjectOfClass(g_classRLightningActor);
+    if (!actor || !IsReadableAddress(actor, 0x2C0)) return;
+
+    void* normal = Read<void*>(actor, kRLightningNormalPSC);
+    void* vertical = Read<void*>(actor, kRLightningVerticalPSC);
+
+    auto pscValid = [](void* psc) -> bool {
+        if (!psc || !IsReadableAddress(psc, 0x2A0)) return false;
+        if (!IsReadableAddress(reinterpret_cast<uint8_t*>(psc) + 0x9C, sizeof(void*))) return false;
+        return Read<void*>(psc, 0x9C) != nullptr;
+    };
+    if (!pscValid(normal) || !pscValid(vertical)) return;
+
+    g_lightningActorCache = actor;
+    g_normalLightningPSCCache = normal;
+    g_verticalLightningPSCCache = vertical;
+    g_lightningCacheReady.store(true, std::memory_order_release);
+    Log(L"LIGHTNING: natural PSC cache resolved on worker thread");
+}
+
+bool TriggerLightningOnGameThread(bool vertical, float seconds, float distance) {
+    using namespace BatLitNative;
+    if (!g_classRLightningActor || !g_fnParticleActivateSystem || !g_fnParticleDeactivateSystem || !g_fnPrimitiveSetTranslation) {
+        Log(L"LIGHTNING: resolver not ready");
+        return false;
+    }
+
+    if (!ResolveNaturalLightningPSCs()) {
+        Log(L"LIGHTNING: cache not ready; background resolver will retry (no game-thread scan)");
+        return false;
+    }
+
+    void* psc = vertical ? g_verticalLightningPSCCache : g_normalLightningPSCCache;
+
+    void* lifetimeModule = vertical ? g_verticalLightningLifetimeModule : g_normalLightningLifetimeModule;
+    if (!SetLightningLifetimeOnGameThread(lifetimeModule, seconds)) {
+        Log(L"LIGHTNING: lifetime lookup write failed");
+        return false;
+    }
+
+    Vec3 cam{};
+    RotatorRaw rot{};
+    float fov = 0.0f;
+    if (!GetRenderedCameraFromCache(cam, rot, fov) && !GetPlayerView(cam, rot)) {
+        Log(L"LIGHTNING: camera unavailable");
+        return false;
+    }
+
+    constexpr double kRuuToRad = 6.28318530717958647692 / 65536.0;
+    const double pitch = static_cast<double>(rot.pitch) * kRuuToRad;
+    const double yaw = static_cast<double>(rot.yaw) * kRuuToRad;
+    const double cp = std::cos(pitch);
+    Vec3 target{};
+    target.x = cam.x + static_cast<float>(cp * std::cos(yaw) * distance);
+    target.y = cam.y + static_cast<float>(cp * std::sin(yaw) * distance);
+    target.z = cam.z + static_cast<float>(std::sin(pitch) * distance);
+
+    // Retrigger the already renderer-registered natural PSC at the requested
+    // camera-front position.
+    ProcessEvent(psc, g_fnParticleDeactivateSystem, nullptr);
+    struct PTranslation { Vec3 NewTranslation; } pt{ target };
+    if (!ProcessEvent(psc, g_fnPrimitiveSetTranslation, &pt)) {
+        Log(L"LIGHTNING: SetTranslation failed");
+        return false;
+    }
+    struct PActivate { int32_t bFlagAsJustAttached{}; int32_t DontUpdateTransform{}; } pa{};
+    if (!ProcessEvent(psc, g_fnParticleActivateSystem, &pa)) {
+        Log(L"LIGHTNING: ActivateSystem failed");
+        return false;
+    }
+
+    wchar_t msg[256]{};
+    swprintf_s(msg, L"LIGHTNING: %s XYZ %.1f %.1f %.1f | %.2fs | distance %.1f",
+        vertical ? L"Vertical" : L"Small", target.x, target.y, target.z, seconds, distance);
+    Log(msg);
+    return true;
+}
+
+
+struct LightningCERequest {
+    bool vertical{};
+    float seconds{1.0f};
+    float distance{5000.0f};
+    int instances{1};
+    int salvoCount{1};
+    float salvoInterval{0.08f};
+    int clusterCount{1};
+    float clusterSpread{0.08f};
+    bool randomizePosition{};
+    float spreadX{0.80f};
+    float spreadY{0.65f};
+    float distanceJitter{0.15f};
+};
+
+static void* SafeReadPtrRaw(void* base, size_t offset) {
+    if (!base) return nullptr;
+    __try {
+        return *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(base) + offset);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+static bool SafeReadU16Raw(void* base, size_t offset, uint16_t& out) {
+    if (!base) return false;
+    __try {
+        out = *reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(base) + offset);
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static bool SafeReadU32Raw(void* base, size_t offset, uint32_t& out) {
+    if (!base) return false;
+    __try {
+        out = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(base) + offset);
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static bool SafeReadIntRaw(void* base, size_t offset, int& out) {
+    if (!base) return false;
+    __try {
+        out = *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(base) + offset);
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+DWORD WINAPI LightningCEPrepareThread(void* param) {
+    auto* reqPtr = reinterpret_cast<LightningCERequest*>(param);
+    if (!reqPtr) return 0;
+    const LightningCERequest req = *reqPtr;
+    delete reqPtr;
+
+    using namespace BatLitNative;
+    auto finish = []() { g_lightningCEBusy.store(false, std::memory_order_release); };
+
+    if (!g_gameBase) {
+        SetLightningStatus(L"CE fast prep: game base unavailable");
+        finish();
+        return 0;
+    }
+
+    // Exact GObject entries established by the working CE tests.
+    void* lightningClass = GObjectAtFixedIndex(kGObj_RLightningActorClass);
+    void* lifetimeModule = GObjectAtFixedIndex(req.vertical ? kGObj_VerticalLifetimeModule : kGObj_SmallLifetimeModule);
+    void* spawnModule = GObjectAtFixedIndex(req.vertical ? kGObj_VerticalSpawnModule : kGObj_SmallSpawnModule);
+    if (!lightningClass || !lifetimeModule || !spawnModule) {
+        SetLightningStatus(L"CE fast prep: class / lifetime / spawn GObject unavailable");
+        finish();
+        return 0;
+    }
+
+    const DWORD t0 = GetTickCount();
+
+    // Reuse the cached actor when possible. Otherwise do the same raw exact-class
+    // walk that worked in CE. No IsReadableAddress/VirtualQuery and no IsA chain.
+    void* lightningActor = g_lightningActorCache;
+    if (!IsExactClassRaw(lightningActor, lightningClass)) {
+        lightningActor = FindLiveExactClassRaw(lightningClass);
+    }
+    if (!lightningActor) {
+        SetLightningStatus(L"CE fast prep: live RLightningActor not found");
+        finish();
+        return 0;
+    }
+
+    void* normal = SafeReadPtrRaw(lightningActor, kRLightningNormalPSC);
+    void* vertical = SafeReadPtrRaw(lightningActor, kRLightningVerticalPSC);
+
+    void* psc = req.vertical ? vertical : normal;
+    if (!psc) {
+        SetLightningStatus(L"CE fast prep: natural PSC is null");
+        finish();
+        return 0;
+    }
+
+    // Do not reject a natural PSC just because SceneInfo is temporarily null.
+    // In the working CE path we triggered the natural component directly; on some
+    // loads the renderer registration can appear a little later (Small showed this
+    // too on first use). Deactivate/SetTranslation/Activate is allowed to run and
+    // the status after the game-thread call tells us whether the trigger completed.
+    void* sceneInfo = SafeReadPtrRaw(psc, 0x9C);
+
+    g_lightningActorCache = lightningActor;
+    g_normalLightningPSCCache = normal;
+    g_verticalLightningPSCCache = vertical;
+    g_lightningCacheReady.store(normal && vertical, std::memory_order_release);
+
+    {
+        std::lock_guard<std::mutex> lock(g_lightningPreparedMutex);
+        g_lightningPrepared.psc = psc;
+        g_lightningPrepared.lifetimeModule = lifetimeModule;
+        g_lightningPrepared.seconds = req.seconds;
+        g_lightningPrepared.distance = req.distance;
+        g_lightningPrepared.instances = req.instances;
+        g_lightningPrepared.salvoCount = req.salvoCount;
+        g_lightningPrepared.salvoInterval = req.salvoInterval;
+        g_lightningPrepared.clusterCount = req.clusterCount;
+        g_lightningPrepared.clusterSpread = req.clusterSpread;
+        g_lightningPrepared.vertical = req.vertical;
+        g_lightningPrepared.randomizePosition = req.randomizePosition;
+        g_lightningPrepared.spreadX = req.spreadX;
+        g_lightningPrepared.spreadY = req.spreadY;
+        g_lightningPrepared.distanceJitter = req.distanceJitter;
+        g_lightningPreparedReady.store(true, std::memory_order_release);
+    }
+
+    wchar_t status[192]{};
+    swprintf_s(status, L"Ready: %s PSC | SceneInfo %s | raw scan %lu ms -> waiting for game tick",
+        req.vertical ? L"Vertical" : L"Small", sceneInfo ? L"OK" : L"pending",
+        static_cast<unsigned long>(GetTickCount() - t0));
+    SetLightningStatus(status);
+    finish();
+    return 0;
+}
+
+bool TriggerLightningCEAsync(bool vertical, float seconds, float distance, int instances, int salvoCount, float salvoInterval, int clusterCount, float clusterSpread, bool randomizePosition, float spreadX, float spreadY, float distanceJitter) {
+    if (!std::isfinite(seconds) || seconds < 0.05f) seconds = 0.05f;
+    if (!std::isfinite(distance) || distance < 100.0f) distance = 100.0f;
+    if (instances < 1) instances = 1;
+    if (instances > 32) instances = 32;
+    if (salvoCount < 1) salvoCount = 1;
+    if (salvoCount > 32) salvoCount = 32;
+    if (!std::isfinite(salvoInterval)) salvoInterval = 0.08f;
+    salvoInterval = (std::max)(0.0f, (std::min)(salvoInterval, 5.0f));
+    if (clusterCount < 1) clusterCount = 1;
+    if (clusterCount > salvoCount) clusterCount = salvoCount;
+    if (clusterCount > 32) clusterCount = 32;
+    if (!std::isfinite(clusterSpread)) clusterSpread = 0.08f;
+    clusterSpread = (std::max)(0.0f, (std::min)(clusterSpread, 0.50f));
+    if (!std::isfinite(spreadX)) spreadX = 0.80f;
+    if (!std::isfinite(spreadY)) spreadY = 0.65f;
+    if (!std::isfinite(distanceJitter)) distanceJitter = 0.15f;
+    spreadX = (std::max)(0.0f, (std::min)(spreadX, 1.0f));
+    spreadY = (std::max)(0.0f, (std::min)(spreadY, 1.0f));
+    distanceJitter = (std::max)(0.0f, (std::min)(distanceJitter, 0.75f));
+
+    bool expected = false;
+    if (!g_lightningCEBusy.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        SetLightningStatus(L"CE prep already running");
+        return false;
+    }
+
+    auto* req = new (std::nothrow) LightningCERequest{};
+    if (!req) {
+        g_lightningCEBusy.store(false, std::memory_order_release);
+        SetLightningStatus(L"CE prep allocation failed");
+        return false;
+    }
+    req->vertical = vertical;
+    req->seconds = seconds;
+    req->distance = distance;
+    req->instances = instances;
+    req->salvoCount = salvoCount;
+    req->salvoInterval = salvoInterval;
+    req->clusterCount = clusterCount;
+    req->clusterSpread = clusterSpread;
+    req->randomizePosition = randomizePosition;
+    req->spreadX = spreadX;
+    req->spreadY = spreadY;
+    req->distanceJitter = distanceJitter;
+
+    SetLightningStatus(vertical ? L"Preparing Vertical Lightning salvo..." : L"Preparing Small Lightning salvo...");
+    HANDLE h = CreateThread(nullptr, 0, LightningCEPrepareThread, req, 0, nullptr);
+    if (!h) {
+        delete req;
+        g_lightningCEBusy.store(false, std::memory_order_release);
+        SetLightningStatus(L"CE prep thread creation failed");
+        return false;
+    }
+    CloseHandle(h);
+    return true;
+}
+
+void QueueLightningTrigger(bool vertical, float seconds, float distance, int instances, int salvoCount, float salvoInterval, int clusterCount, float clusterSpread, bool randomizePosition, float spreadX, float spreadY, float distanceJitter) {
+    TriggerLightningCEAsync(vertical, seconds, distance, instances, salvoCount, salvoInterval, clusterCount, clusterSpread, randomizePosition, spreadX, spreadY, distanceJitter);
+}
+
+void ProcessLightningRequestOnGameThread() {
+    using namespace BatLitNative;
+
+    // A salvo is deliberately executed over successive EngineTick calls. This is
+    // the automatic equivalent of repeatedly pressing Execute in the CE tests,
+    // without ever sleeping/blocking the game thread.
+    static bool salvoActive = false;
+    static LightningPreparedRequest salvoReq{};
+    static int salvoRemaining = 0;
+    static int salvoShotIndex = 0;
+    static int salvoClusterCount = 1;
+    static bool clusterCentersReady = false;
+    static std::array<float, 32> clusterCenterX{};
+    static std::array<float, 32> clusterCenterY{};
+    static ULONGLONG nextShotMs = 0;
+
+    if (g_lightningPreparedReady.exchange(false, std::memory_order_acq_rel)) {
+        std::lock_guard<std::mutex> lock(g_lightningPreparedMutex);
+        salvoReq = g_lightningPrepared;
+        salvoReq.salvoCount = (std::max)(1, (std::min)(salvoReq.salvoCount, 32));
+        salvoReq.clusterCount = (std::max)(1, (std::min)(salvoReq.clusterCount, salvoReq.salvoCount));
+        salvoReq.clusterSpread = (std::max)(0.0f, (std::min)(salvoReq.clusterSpread, 0.50f));
+        salvoReq.salvoInterval = (std::max)(0.0f, (std::min)(salvoReq.salvoInterval, 5.0f));
+        salvoRemaining = salvoReq.salvoCount;
+        salvoShotIndex = 0;
+        salvoClusterCount = salvoReq.clusterCount;
+        clusterCentersReady = false;
+        nextShotMs = 0;
+        salvoActive = true;
+    }
+
+    if (!salvoActive || salvoRemaining <= 0) return;
+
+    const ULONGLONG nowMs = GetTickCount64();
+    if (nextShotMs != 0 && nowMs < nextShotMs) return;
+
+    const LightningPreparedRequest req = salvoReq;
+    if (!req.psc || !req.lifetimeModule || !g_fnParticleDeactivateSystem || !g_fnPrimitiveSetTranslation || !g_fnParticleActivateSystem) {
+        SetLightningStatus(L"Game tick: resolver / prepared request invalid");
+        salvoActive = false;
+        return;
+    }
+
+    void* pc = g_inputBlockPC;
+    if (!pc || !IsReadableAddress(reinterpret_cast<uint8_t*>(pc) + kPlayerControllerPlayerCamera, sizeof(void*))) {
+        pc = GetPlayerController_BmSDKPath();
+    }
+    if (!pc) {
+        SetLightningStatus(L"Game tick: PlayerController unavailable");
+        salvoActive = false;
+        return;
+    }
+
+    void* camera = Read<void*>(pc, kPlayerControllerPlayerCamera);
+    const ptrdiff_t povOff = kCameraCache + kCameraCachePOV;
+    if (!camera || !IsReadableAddress(reinterpret_cast<uint8_t*>(camera) + povOff, 24)) {
+        SetLightningStatus(L"Game tick: PlayerCamera / POV invalid");
+        salvoActive = false;
+        return;
+    }
+
+    const Vec3 cam = Read<Vec3>(camera, povOff + 0x00);
+    const RotatorRaw rot = Read<RotatorRaw>(camera, povOff + 0x0C);
+    if (!std::isfinite(cam.x) || !std::isfinite(cam.y) || !std::isfinite(cam.z)) {
+        SetLightningStatus(L"Game tick: camera coordinates invalid");
+        salvoActive = false;
+        return;
+    }
+
+    constexpr double kRuuToRad = 6.28318530717958647692 / 65536.0;
+    const double pitch = static_cast<double>(rot.pitch) * kRuuToRad;
+    const double yaw = static_cast<double>(rot.yaw) * kRuuToRad;
+    const double cp = std::cos(pitch);
+    const double sp = std::sin(pitch);
+    const double cy = std::cos(yaw);
+    const double sy = std::sin(yaw);
+
+    Vec3 forward{ static_cast<float>(cp * cy), static_cast<float>(cp * sy), static_cast<float>(sp) };
+    Vec3 right{ static_cast<float>(-sy), static_cast<float>(cy), 0.0f };
+    Vec3 up{ static_cast<float>(-sp * cy), static_cast<float>(-sp * sy), static_cast<float>(cp) };
+
+    static uint32_t rngState = 0;
+    if (rngState == 0) {
+        LARGE_INTEGER qpc{};
+        QueryPerformanceCounter(&qpc);
+        rngState = static_cast<uint32_t>(qpc.LowPart) ^ GetTickCount() ^ 0xA3C59AC3u;
+        if (rngState == 0) rngState = 0x6D2B79F5u;
+    }
+    auto nextUnit = [&]() -> float {
+        rngState ^= rngState << 13;
+        rngState ^= rngState >> 17;
+        rngState ^= rngState << 5;
+        return static_cast<float>(rngState & 0x00FFFFFFu) / 16777215.0f;
+    };
+    auto nextSigned = [&]() -> float { return nextUnit() * 2.0f - 1.0f; };
+
+    float targetDistance = req.distance;
+    float screenX = 0.0f;
+    float screenY = 0.0f;
+    float fovDeg = 90.0f;
+    float aspect = 16.0f / 9.0f;
+    int clusterIndex = 0;
+
+    if (req.randomizePosition) {
+        targetDistance *= 1.0f + nextSigned() * req.distanceJitter;
+        if (targetDistance < 100.0f) targetDistance = 100.0f;
+
+        if (IsReadableAddress(reinterpret_cast<uint8_t*>(camera) + povOff, 0x20)) {
+            const float rawFov = Read<float>(camera, povOff + 0x18);
+            const float rawAspect = Read<float>(camera, povOff + 0x1C);
+            if (std::isfinite(rawFov) && rawFov >= 20.0f && rawFov <= 170.0f) fovDeg = rawFov;
+            if (std::isfinite(rawAspect) && rawAspect >= 0.5f && rawAspect <= 4.0f) aspect = rawAspect;
+        }
+
+        // Generate persistent cluster centers once per salvo. ClusterSpread = 0
+        // means repeated strikes can hit exactly the same screen-space location.
+        if (!clusterCentersReady) {
+            for (int i = 0; i < salvoClusterCount; ++i) {
+                clusterCenterX[i] = nextSigned() * req.spreadX;
+                clusterCenterY[i] = nextSigned() * req.spreadY;
+            }
+            clusterCentersReady = true;
+        }
+
+        // Make sure every requested cluster gets at least one strike first, then
+        // choose randomly. This gives both radical separation and natural repeats.
+        if (salvoShotIndex < salvoClusterCount) {
+            clusterIndex = salvoShotIndex;
+        } else {
+            clusterIndex = static_cast<int>(nextUnit() * static_cast<float>(salvoClusterCount));
+            if (clusterIndex >= salvoClusterCount) clusterIndex = salvoClusterCount - 1;
+        }
+
+        screenX = clusterCenterX[clusterIndex] + nextSigned() * req.clusterSpread;
+        screenY = clusterCenterY[clusterIndex] + nextSigned() * req.clusterSpread;
+        screenX = (std::max)(-req.spreadX, (std::min)(screenX, req.spreadX));
+        screenY = (std::max)(-req.spreadY, (std::min)(screenY, req.spreadY));
+    }
+
+    Vec3 target{};
+    target.x = cam.x + forward.x * targetDistance;
+    target.y = cam.y + forward.y * targetDistance;
+    target.z = cam.z + forward.z * targetDistance;
+
+    if (req.randomizePosition) {
+        const float fovRad = fovDeg * (3.14159265358979323846f / 180.0f);
+        const float halfWidth = std::tan(fovRad * 0.5f) * targetDistance;
+        const float halfHeight = halfWidth / aspect;
+        const float offRight = screenX * halfWidth;
+        const float offUp = screenY * halfHeight;
+        target.x += right.x * offRight + up.x * offUp;
+        target.y += right.y * offRight + up.y * offUp;
+        target.z += right.z * offRight + up.z * offUp;
+    }
+
+    if (!SetLightningLifetimeOnGameThread(req.lifetimeModule, req.seconds)) {
+        SetLightningStatus(L"Game tick: lifetime lookup write failed");
+        salvoActive = false;
+        return;
+    }
+
+    void* spawnModule = req.vertical ? g_verticalLightningSpawnModule : g_normalLightningSpawnModule;
+    int burstEntries = 0;
+    if (!SetLightningInstancesOnGameThread(spawnModule, req.instances, &burstEntries)) {
+        SetLightningStatus(L"Game tick: lightning BurstList / instances write failed");
+        salvoActive = false;
+        return;
+    }
+
+    ProcessEvent(req.psc, g_fnParticleDeactivateSystem, nullptr);
+    alignas(8) uint8_t translationParams[0x20]{};
+    memcpy(translationParams + 0x00, &target, sizeof(target));
+    if (!ProcessEvent(req.psc, g_fnPrimitiveSetTranslation, translationParams)) {
+        SetLightningStatus(L"Game tick: SetTranslation failed");
+        salvoActive = false;
+        return;
+    }
+    alignas(8) uint8_t activateParams[0x10]{};
+    if (!ProcessEvent(req.psc, g_fnParticleActivateSystem, activateParams)) {
+        SetLightningStatus(L"Game tick: ActivateSystem failed");
+        salvoActive = false;
+        return;
+    }
+
+    const int shotNumber = salvoShotIndex + 1;
+    --salvoRemaining;
+    ++salvoShotIndex;
+    if (salvoRemaining > 0) {
+        const ULONGLONG intervalMs = static_cast<ULONGLONG>(req.salvoInterval * 1000.0f + 0.5f);
+        nextShotMs = nowMs + intervalMs;
+    } else {
+        salvoActive = false;
+        nextShotMs = 0;
+    }
+
+    wchar_t status[384]{};
+    if (req.randomizePosition) {
+        swprintf_s(status, L"OK: %s | salvo %d/%d | cluster %d/%d | %.2fs | distance %.0f | instances %d | random X %.2f Y %.2f",
+            req.vertical ? L"Vertical" : L"Small", shotNumber, req.salvoCount,
+            clusterIndex + 1, salvoClusterCount, req.seconds, targetDistance, req.instances, screenX, screenY);
+    } else {
+        swprintf_s(status, L"OK: %s | salvo %d/%d | %.2fs | distance %.0f | instances %d | centered",
+            req.vertical ? L"Vertical" : L"Small", shotNumber, req.salvoCount,
+            req.seconds, targetDistance, req.instances);
+    }
+    SetLightningStatus(status);
+    Log(status);
+}
+void UpdateRadioModeEyesOnGameThread() {
+    const int req = g_radioEyesRequest.exchange(-1);
+    if (req < 0) return;
+    QueueConsoleCommand(req ? L"set BmScript.RPawnPlayerBm bRadioModeEyes 1" : L"set BmScript.RPawnPlayerBm bRadioModeEyes 0");
+}
+
+intptr_t __fastcall HookEngineTick(void* self) {
+    const DWORD tid = GetCurrentThreadId();
+    if (g_gameThreadId.load() == 0) g_gameThreadId.store(tid);
+    if (!g_inCommandDispatch) {
+        g_inCommandDispatch = true;
+        CheckForLevelRestartAndCleanupLights();
+        ExecuteCommands();
+        UpdatePendingLightRecords();
+        UpdateRadioModeEyesOnGameThread();
+        ProcessQueuedConsoleCommandsOnGameThread();
+        ProcessLightningRequestOnGameThread();
+        UpdateExposureOverrideOnGameThread();
+        UpdateGameInputBlockOnGameThread();
+        g_inCommandDispatch = false;
+    }
+    return g_originalEngineTick ? g_originalEngineTick(self) : 0;
+}
+
+
+bool ResolvePropertyOffsetLayout() {
+    // Resolve UProperty::Offset_Internal from the SDK metadata itself.
+    // Prefer relationships between adjacent members of Pollen/Dust/Snow;
+    // this avoids depending on one hard-coded actor/component offset.
+    void* pPollenBox   = FindObject(L"Engine.RPollenComponent.BoxSize");
+    void* pPollenCount = FindObject(L"Engine.RPollenComponent.ParticleCount");
+    void* pDustFade    = FindObject(L"Engine.RDustComponent.fade");
+    void* pDustBox     = FindObject(L"Engine.RDustComponent.BoxSize");
+    void* pDustCount   = FindObject(L"Engine.RDustComponent.ParticleCount");
+    void* pSnowCull    = FindObject(L"Engine.RSnowComponent.CameraCullingDistance");
+    void* pSnowBox     = FindObject(L"Engine.RSnowComponent.BoxSize");
+    void* pSnowCount   = FindObject(L"Engine.RSnowComponent.ParticleCount");
+
+    int field = -1;
+    // UE3 UProperty::Offset_Internal is a WORD in this BatmanAK build.
+    // The current SDK dump confirms it at UProperty + 0x6A.
+    auto readCandidate = [](void* prop, int off, int& out) -> bool {
+        if (!prop || !IsReadableAddress(reinterpret_cast<uint8_t*>(prop) + off, sizeof(uint16_t))) return false;
+        out = static_cast<int>(*reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(prop) + off));
+        return out >= 0 && out < 0x4000;
+    };
+
+    // In all three SDK classes these fields are declared contiguously:
+    //   Pollen: BoxSize, ParticleCount
+    //   Dust:   fade, BoxSize, ParticleCount
+    //   Snow:   CameraCullingDistance, BoxSize, ParticleCount
+    // Their runtime member offsets must therefore advance by 4 bytes.
+    for (int off = 0x40; off <= 0x180; ++off) {
+        int pb=0, pc=0, df=0, db=0, dc=0, sc=0, sb=0, sn=0;
+        if (!readCandidate(pPollenBox, off, pb) || !readCandidate(pPollenCount, off, pc) ||
+            !readCandidate(pDustFade, off, df) || !readCandidate(pDustBox, off, db) || !readCandidate(pDustCount, off, dc) ||
+            !readCandidate(pSnowCull, off, sc) || !readCandidate(pSnowBox, off, sb) || !readCandidate(pSnowCount, off, sn)) continue;
+        if (pc == pb + 4 && db == df + 4 && dc == db + 4 && sb == sc + 4 && sn == sb + 4) {
+            field = off;
+            break;
+        }
+    }
+
+    // Fallback: calibrate from two long-confirmed Actor offsets if the SDK
+    // relationship pass could not identify the field.
+    if (field < 0) {
+        void* pLocation = FindObject(L"Engine.Actor.Location");
+        void* pRotation = FindObject(L"Engine.Actor.Rotation");
+        if (pLocation && pRotation) {
+            for (int off = 0x40; off <= 0x180; ++off) {
+                int a=0, b=0;
+                if (!readCandidate(pLocation, off, a) || !readCandidate(pRotation, off, b)) continue;
+                if (a == static_cast<int>(kActorLocation) && b == static_cast<int>(kActorRotation)) {
+                    field = off;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (field < 0) {
+        // Final build-specific fallback. Validate the known metadata location
+        // against Actor.Location/Rotation before accepting it.
+        void* pLocation = FindObject(L"Engine.Actor.Location");
+        void* pRotation = FindObject(L"Engine.Actor.Rotation");
+        int locOff = -1, rotOff = -1;
+        if (readCandidate(pLocation, 0x6A, locOff) && readCandidate(pRotation, 0x6A, rotOff) &&
+            locOff == static_cast<int>(kActorLocation) && rotOff == static_cast<int>(kActorRotation)) {
+            field = 0x6A;
+            Log(L"ENV: UProperty Offset_Internal validated at +0x6A");
+        }
+    }
+
+    if (field < 0) {
+        Log(L"ENV: could not calibrate UProperty Offset_Internal field from SDK metadata");
+        return false;
+    }
+
+    auto propertyOffset = [&](const wchar_t* name) -> int {
+        void* prop = FindObject(name);
+        int v = -1;
+        if (!readCandidate(prop, field, v)) return -1;
+        return v;
+    };
+
+    g_uPropertyOffsetField = field;
+    g_rainParticleCountOffset = propertyOffset(L"Engine.RRainComponent.ParticleCount");
+    g_pollenParticleCountOffset = propertyOffset(L"Engine.RPollenComponent.ParticleCount");
+    g_dustParticleCountOffset = propertyOffset(L"Engine.RDustComponent.ParticleCount");
+    g_snowParticleCountOffset = propertyOffset(L"Engine.RSnowComponent.ParticleCount");
+    g_fogStartDistanceOffset = propertyOffset(L"Engine.ExponentialHeightFogComponent.StartDistance");
+    g_fogMaxOpacityOffset = propertyOffset(L"Engine.ExponentialHeightFogComponent.FogMaxOpacity");
+    g_fogHeightFalloffOffset = propertyOffset(L"Engine.ExponentialHeightFogComponent.FogHeightFalloff");
+    g_fogDensityOffset = propertyOffset(L"Engine.ExponentialHeightFogComponent.FogDensity");
+    g_fogHeightOffset = propertyOffset(L"Engine.ExponentialHeightFogComponent.FogHeight");
+
+    // Resolve the UE3 BoolProperty bitmask for bRadioModeEyes.
+    // Use neighboring RPawnPlayerBm bools and look for the metadata field where
+    // each property has a distinct single-bit mask.
+    g_radioModeEyesOffset = propertyOffset(L"BmScript.RPawnPlayerBm.bRadioModeEyes");
+    g_radioModeEyesMask = 0;
+    void* pInvEyes   = FindObject(L"BmScript.RPawnPlayerBm.bInvestigateModeEyes");
+    void* pRadioEyes = FindObject(L"BmScript.RPawnPlayerBm.bRadioModeEyes");
+    void* pSwitchX   = FindObject(L"BmScript.RPawnPlayerBm.bSwitchCharInXRay");
+    void* pFingers   = FindObject(L"BmScript.RPawnPlayerBm.bFingersAttached");
+    auto readU32 = [](void* prop, int off, uint32_t& out) -> bool {
+        if (!prop || !IsReadableAddress(reinterpret_cast<uint8_t*>(prop) + off, 4)) return false;
+        out = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(prop) + off);
+        return true;
+    };
+    auto singleBit = [](uint32_t v) -> bool { return v && ((v & (v - 1u)) == 0); };
+    for (int off = 0x40; off <= 0x180; off += 4) {
+        uint32_t a=0,b=0,c=0,d=0;
+        if (!readU32(pInvEyes,off,a) || !readU32(pRadioEyes,off,b) ||
+            !readU32(pSwitchX,off,c) || !readU32(pFingers,off,d)) continue;
+        if (singleBit(a) && singleBit(b) && singleBit(c) && singleBit(d) &&
+            a != b && a != c && a != d && b != c && b != d && c != d) {
+            g_radioModeEyesMask = b;
+            break;
+        }
+    }
+
+    wchar_t radioMsg[256]{};
+    swprintf_s(radioMsg, L"RADIO EYES: bRadioModeEyes offset=+0x%X mask=0x%08X",
+        g_radioModeEyesOffset, g_radioModeEyesMask);
+    Log(radioMsg);
+
+    wchar_t msg[384]{};
+    swprintf_s(msg, L"ENV: UProperty field=+0x%X | Rain=+0x%X Pollen=+0x%X Dust=+0x%X Snow=+0x%X | Fog Start=+0x%X MaxOpacity=+0x%X Falloff=+0x%X Density=+0x%X Height=+0x%X",
+        g_uPropertyOffsetField, g_rainParticleCountOffset, g_pollenParticleCountOffset, g_dustParticleCountOffset, g_snowParticleCountOffset,
+        g_fogStartDistanceOffset, g_fogMaxOpacityOffset, g_fogHeightFalloffOffset, g_fogDensityOffset, g_fogHeightOffset);
+    Log(msg);
+
+    const bool particlesReady = g_rainParticleCountOffset >= 0 && g_pollenParticleCountOffset >= 0 && g_dustParticleCountOffset >= 0 && g_snowParticleCountOffset >= 0;
+    if (!particlesReady) Log(L"ENV: SDK metadata field found, but one or more particle offsets are unresolved");
+    return particlesReady;
+}
+
+bool Init() {
+    g_gameBase=reinterpret_cast<uintptr_t>(GetModuleHandleW(L"BatmanAK.exe")); if(!g_gameBase) return false;
+    auto* dos=reinterpret_cast<IMAGE_DOS_HEADER*>(g_gameBase);
+    auto* nt=(dos && dos->e_magic==IMAGE_DOS_SIGNATURE) ? reinterpret_cast<IMAGE_NT_HEADERS64*>(g_gameBase+dos->e_lfanew) : nullptr;
+    if(!nt || nt->Signature!=IMAGE_NT_SIGNATURE || nt->FileHeader.TimeDateStamp!=kExpectedTimeDateStamp || nt->OptionalHeader.SizeOfImage!=kExpectedSizeOfImage) {
+        Log(L"BatLit: BatmanAK.exe build mismatch; native light hook disabled for safety");
+        return false;
+    }
+    g_staticFindObject=reinterpret_cast<StaticFindObjectFn>(g_gameBase+kStaticFindObject);
+    g_processEvent=reinterpret_cast<ProcessEventFn>(g_gameBase+kProcessEvent);
+    g_spawnActor=reinterpret_cast<SpawnActorFn>(g_gameBase+kSpawnActor);
+    g_getDefaultObject=reinterpret_cast<GetDefaultObjectFn>(g_gameBase+kGetDefaultObject);
+    if(!IsExecutableAddress(reinterpret_cast<void*>(g_staticFindObject))||!IsExecutableAddress(reinterpret_cast<void*>(g_processEvent))||!IsExecutableAddress(reinterpret_cast<void*>(g_spawnActor))||!IsExecutableAddress(reinterpret_cast<void*>(g_getDefaultObject))) { Log(L"BatLit: native offsets failed executable-address validation"); return false; }
+    g_classFunction=FindObject(L"Core.Function"); g_classPointLightMovable=FindObject(L"Engine.PointLightMovable"); g_classSpotLightMovable=FindObject(L"Engine.SpotLightMovable"); g_classPlayerController=FindObject(L"BmGame.RPlayerController"); g_classWorldInfo=FindObject(L"Engine.WorldInfo"); g_classEngine=FindObject(L"Engine.Engine"); g_classRRainComponent=FindObject(L"Engine.RRainComponent"); g_classRPollenComponent=FindObject(L"Engine.RPollenComponent"); g_classRDustComponent=FindObject(L"Engine.RDustComponent"); g_classRSnowComponent=FindObject(L"Engine.RSnowComponent"); g_classExponentialHeightFogComponent=FindObject(L"Engine.ExponentialHeightFogComponent"); g_classRPawnPlayerBm=FindObject(L"BmScript.RPawnPlayerBm");
+    g_classRLightningActor=GObjectAtFixedIndex(kGObj_RLightningActorClass); if(!g_classRLightningActor) g_classRLightningActor=FindObject(L"BmGame.RLightningActor");
+    g_normalLightningLifetimeModule=GObjectAtFixedIndex(kGObj_SmallLifetimeModule);
+    g_verticalLightningLifetimeModule=GObjectAtFixedIndex(kGObj_VerticalLifetimeModule);
+    g_normalLightningSpawnModule=GObjectAtFixedIndex(kGObj_SmallSpawnModule);
+    g_verticalLightningSpawnModule=GObjectAtFixedIndex(kGObj_VerticalSpawnModule);
+    g_fnGetPlayerViewPoint=FindFunction(L"Engine.PlayerController.GetPlayerViewPoint"); g_fnWorldInfoGetWorldInfo=FindFunction(L"Engine.WorldInfo.GetWorldInfo"); g_fnEngineGetEngine=FindFunction(L"Engine.Engine.GetEngine"); g_fnFindPlayerByControllerId=FindFunction(L"Engine.GameViewportClient.FindPlayerByControllerId"); g_fnSetEnabled=FindFunction(L"Engine.LightComponent.SetEnabled"); g_fnLightColor=FindFunction(L"Engine.PointLightComponent.OnUpdatePropertyLightColor"); g_fnBrightness=FindFunction(L"Engine.PointLightComponent.OnUpdatePropertyBrightness"); g_fnUpdateColorBrightness=FindFunction(L"Engine.LightComponent.UpdateColorAndBrightness"); g_fnUpdateShafts=FindFunction(L"Engine.LightComponent.UpdateLightShaftParameters"); g_fnSetTranslation=FindFunction(L"Engine.PointLightComponent.SetTranslation"); g_fnSetAngleRadius=FindFunction(L"Engine.SpotLightComponent.SetAngleAndRadius"); g_fnSetRotation=FindFunction(L"Engine.SpotLightComponent.SetRotation"); g_fnSetAbsoluteRotation=FindFunction(L"Engine.SpotLightComponent.SetAbsoluteRotation"); g_fnActorSetLocation=FindFunction(L"Engine.Actor.SetLocation"); g_fnActorSetRotation=FindFunction(L"Engine.Actor.SetRotation"); g_fnActorDestroy=FindFunction(L"Engine.Actor.Destroy");
+    g_fnIgnoreMoveInput=FindFunction(L"Engine.PlayerController.IgnoreMoveInput"); g_fnIgnoreLookInput=FindFunction(L"Engine.PlayerController.IgnoreLookInput"); g_fnIgnoreButtonInput=FindFunction(L"Engine.PlayerController.IgnoreButtonInput"); g_fnIsMoveInputIgnored=FindFunction(L"Engine.PlayerController.IsMoveInputIgnored"); g_fnIsLookInputIgnored=FindFunction(L"Engine.PlayerController.IsLookInputIgnored"); g_fnIsButtonInputIgnored=FindFunction(L"Engine.PlayerController.IsButtonInputIgnored"); g_fnResetPlayerMovementInput=FindFunction(L"Engine.PlayerController.ResetPlayerMovementInput"); g_fnFogSetEnabled=FindFunction(L"Engine.ExponentialHeightFogComponent.SetEnabled"); g_fnRadioModeEyesAndEffects=FindFunction(L"BmScript.RPawnPlayerBm.RadioModeEyesAndEffects"); g_fnConsoleCommand=FindFunction(L"Engine.PlayerController.ConsoleCommand"); if(!g_fnRadioModeEyesAndEffects) g_fnRadioModeEyesAndEffects=FindFunction(L"BmGame.RPawnPlayer.RadioModeEyesAndEffects");
+    g_fnParticleActivateSystem=FindFunction(L"Engine.ParticleSystemComponent.ActivateSystem");
+    g_fnParticleDeactivateSystem=FindFunction(L"Engine.ParticleSystemComponent.DeactivateSystem");
+    g_fnPrimitiveSetTranslation=FindFunction(L"Engine.PrimitiveComponent.SetTranslation");
+    Log((g_classRLightningActor && g_normalLightningLifetimeModule && g_verticalLightningLifetimeModule && g_normalLightningSpawnModule && g_verticalLightningSpawnModule && g_fnParticleActivateSystem && g_fnParticleDeactivateSystem && g_fnPrimitiveSetTranslation) ? L"LIGHTNING: Small/Vertical resolver ready" : L"LIGHTNING: resolver incomplete");
+    const bool inputReady=g_fnIgnoreMoveInput&&g_fnIgnoreLookInput&&g_fnIgnoreButtonInput&&g_fnIsMoveInputIgnored&&g_fnIsLookInputIgnored&&g_fnIsButtonInputIgnored;
+    Log(inputReady?L"INPUT UE3: IgnoreMove/Look/Button functions resolved":L"INPUT UE3: one or more ignore-input functions NOT resolved");
+    const bool envReflectionReady = ResolvePropertyOffsetLayout();
+    Log(envReflectionReady ? L"ENV: location-dependent particle reflection ready" : L"ENV: location-dependent particle reflection NOT ready");
+    const bool ok=g_classFunction&&g_classPointLightMovable&&g_classSpotLightMovable&&g_classPlayerController&&g_classWorldInfo&&g_classEngine&&g_fnGetPlayerViewPoint&&g_fnWorldInfoGetWorldInfo&&g_fnEngineGetEngine&&g_fnFindPlayerByControllerId&&g_fnSetEnabled&&g_fnLightColor&&g_fnBrightness&&g_fnSetTranslation&&g_fnSetAngleRadius&&g_fnSetRotation&&g_fnActorSetLocation&&g_fnActorSetRotation;
+    Log(ok?L"BatLit: native UE3 resolver ready":L"BatLit: one or more UE3 objects/functions were not resolved"); return ok;
+}
+
+bool HookTick() {
+    if(!g_gameBase && !Init()) return false;
+
+    void* tickAddr=reinterpret_cast<void*>(g_gameBase+kEngineTick);
+    if(!IsExecutableAddress(tickAddr)) return false;
+
+    const MH_STATUS init=MH_Initialize();
+    if(init!=MH_OK&&init!=MH_ERROR_ALREADY_INITIALIZED) return false;
+
+    const MH_STATUS createTick=MH_CreateHook(tickAddr,&HookEngineTick,reinterpret_cast<void**>(&g_originalEngineTick));
+    if(createTick!=MH_OK&&createTick!=MH_ERROR_ALREADY_CREATED) return false;
+
+    const MH_STATUS enableTick=MH_EnableHook(tickAddr);
+    const bool ok=(enableTick==MH_OK||enableTick==MH_ERROR_ENABLED);
+    if (ok) Log(L"BatLit SAFE: EngineTick dispatcher enabled (no ProcessInternal re-entry)");
+    return ok;
+}
+
+
+// Rain follows the validated CE table Batman_Arkham_Knight_Rain_BmSDK_v0.5_WRITE_ENGINE_ONLY.
+// IMPORTANT: only the ENGINE copy is writable. Console is deliberately ignored.
+// Engine AOB: 0x0D000000..0x10000000; RainEngineBase = hit - 0x210;
+// ParticleCount = RainEngineBase + 0x21C = hit + 0x0C.
+
+
+} // namespace BatLitNative
+
+
+struct CapeDefaults {
+    uint32_t flags{};
+    float linearForceLimit{}, linearStrength{}, linearDamping{};
+    float angularForceLimit{}, angularStrength{}, angularDamping{};
+    float driveTolerance{}, minRotVel{};
+    float forceStrengthMultiplier{}, maxForceCap{};
+    float chainStrengthMin{}, chainStrengthOverLength{};
+    float overstretchDistance{}, minWindSpeed{}, maxWindSpeed{}, upwardsWindScale{};
+    float windX{}, windY{}, windZ{};
+    float springBlendSpeed{}, runStartLength{}, runStartForce{}, runIncreaseRate{};
+    bool valid = false;
+};
+struct RainDefaults { int particleCount{}; bool valid = false; };
+struct EnvParticleRef {
+    void* object{};
+    int originalCount{};
+};
+struct FogRef {
+    void* object{};
+    float startDistance{}, maxOpacity{}, heightFalloff{}, density{}, height{};
+};
+CapeDefaults g_capeDefaults;
+RainDefaults g_rainDefaults;
+std::mutex g_envParticleMutex;
+std::vector<EnvParticleRef> g_rainRefs;
+std::vector<EnvParticleRef> g_pollenRefs;
+std::vector<EnvParticleRef> g_dustRefs;
+std::vector<EnvParticleRef> g_snowRefs;
+std::vector<FogRef> g_fogRefs;
+std::atomic<int> g_rainLiveCount{0};
+std::atomic<int> g_pollenLiveCount{0};
+std::atomic<int> g_dustLiveCount{0};
+std::atomic<int> g_snowLiveCount{0};
+std::atomic<int> g_fogLiveCount{0};
+std::atomic<bool> g_envParticleResolverReady{false};
+std::atomic<bool> g_weatherParticleResolverReady{false};
+std::atomic<bool> g_snowResolverReady{false};
+
+int PreserveOriginalCount(void* obj, int current, const std::vector<EnvParticleRef>& oldRefs) {
+    for (const auto& r : oldRefs) if (r.object == obj) return r.originalCount;
+    return current;
+}
+
+
+void RefreshWeatherParticleComponentsFast() {
+    using namespace BatLitNative;
+    if (!g_gameBase || !g_classRRainComponent || !g_classRPollenComponent || !g_classRDustComponent || !g_classRSnowComponent) {
+        g_weatherParticleResolverReady.store(false);
+        g_snowResolverReady.store(false);
+        return;
+    }
+
+    auto resolveOffset = [&](const wchar_t* propName, int& outOffset, const wchar_t* label) {
+        if (outOffset >= 0) return;
+        void* prop = FindObject(propName);
+        if (!prop) return;
+        uint16_t off = 0;
+        if (!SafeReadU16Raw(prop, 0x6A, off)) return;
+        if (off > 0 && off < 0x4000) {
+            outOffset = static_cast<int>(off);
+            wchar_t m[192]{};
+            swprintf_s(m, L"ENV %s: ParticleCount offset resolved directly at +0x%X", label, outOffset);
+            Log(m);
+        }
+    };
+
+    resolveOffset(L"Engine.RRainComponent.ParticleCount",   g_rainParticleCountOffset,   L"Rain");
+    resolveOffset(L"Engine.RPollenComponent.ParticleCount", g_pollenParticleCountOffset, L"Pollen");
+    resolveOffset(L"Engine.RDustComponent.ParticleCount",   g_dustParticleCountOffset,   L"Dust");
+    resolveOffset(L"Engine.RSnowComponent.ParticleCount",   g_snowParticleCountOffset,   L"Snow");
+
+    if (g_rainParticleCountOffset < 0 || g_pollenParticleCountOffset < 0 ||
+        g_dustParticleCountOffset < 0 || g_snowParticleCountOffset < 0) {
+        g_weatherParticleResolverReady.store(false);
+        g_snowResolverReady.store(false);
+        return;
+    }
+
+    std::vector<EnvParticleRef> oldRain, oldPollen, oldDust, oldSnow;
+    {
+        std::lock_guard<std::mutex> lock(g_envParticleMutex);
+        oldRain = g_rainRefs;
+        oldPollen = g_pollenRefs;
+        oldDust = g_dustRefs;
+        oldSnow = g_snowRefs;
+    }
+
+    std::vector<EnvParticleRef> rain, pollen, dust, snow;
+    auto** objects = reinterpret_cast<void**>(g_gameBase + kGObjects);
+    int n = 0;
+    SafeReadIntRaw(reinterpret_cast<void*>(g_gameBase), kGObjectsNumOff, n);
+    if (n <= 0 || n > kGObjectsCapacity) n = kGObjectsCapacity;
+
+    for (int i = 0; i < n; ++i) {
+        void* obj = SafeGObjectAt(objects, i);
+        if (!obj) continue;
+        void* cls = SafeReadPtrRaw(obj, kUObjectClass);
+        if (!cls) continue;
+
+        int off = -1;
+        std::vector<EnvParticleRef>* out = nullptr;
+        const std::vector<EnvParticleRef>* old = nullptr;
+        if (cls == g_classRRainComponent)        { off = g_rainParticleCountOffset;   out = &rain;   old = &oldRain; }
+        else if (cls == g_classRPollenComponent) { off = g_pollenParticleCountOffset; out = &pollen; old = &oldPollen; }
+        else if (cls == g_classRDustComponent)   { off = g_dustParticleCountOffset;   out = &dust;   old = &oldDust; }
+        else if (cls == g_classRSnowComponent)   { off = g_snowParticleCountOffset;   out = &snow;   old = &oldSnow; }
+        else continue;
+
+        uint32_t flags = 0;
+        if (!SafeReadU32Raw(obj, kUObjectFlags, flags)) continue;
+        if (flags & kRF_ClassDefaultObject) continue;
+        int v = 0;
+        if (!SafeReadIntRaw(obj, static_cast<size_t>(off), v)) continue;
+        if (v < 0 || v > 5000000) continue;
+        out->push_back({obj, PreserveOriginalCount(obj, v, *old)});
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_envParticleMutex);
+        g_rainRefs.swap(rain);
+        g_pollenRefs.swap(pollen);
+        g_dustRefs.swap(dust);
+        g_snowRefs.swap(snow);
+        g_rainLiveCount.store(static_cast<int>(g_rainRefs.size()));
+        g_pollenLiveCount.store(static_cast<int>(g_pollenRefs.size()));
+        g_dustLiveCount.store(static_cast<int>(g_dustRefs.size()));
+        g_snowLiveCount.store(static_cast<int>(g_snowRefs.size()));
+
+        auto logFirst = [&](const wchar_t* label, const std::vector<EnvParticleRef>& refs, int off) {
+            if (refs.empty()) return;
+            auto* pCount = reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(refs.front().object) + off);
+            if (!IsReadableAddress(pCount, sizeof(int))) return;
+            wchar_t m[192]{};
+            swprintf_s(m, L"ENV %s: live component=%p ParticleCount=%d offset=+0x%X", label, refs.front().object, *pCount, off);
+            Log(m);
+        };
+        logFirst(L"Rain", g_rainRefs, g_rainParticleCountOffset);
+        logFirst(L"Pollen", g_pollenRefs, g_pollenParticleCountOffset);
+        logFirst(L"Dust", g_dustRefs, g_dustParticleCountOffset);
+        logFirst(L"Snow", g_snowRefs, g_snowParticleCountOffset);
+    }
+
+    g_weatherParticleResolverReady.store(true);
+    g_snowResolverReady.store(true);
+}
+
+void RefreshLocationDependentParticles() {
+    using namespace BatLitNative;
+    if (!g_gameBase) {
+        g_envParticleResolverReady.store(false);
+        return;
+    }
+
+    std::vector<FogRef> oldFog;
+    {
+        std::lock_guard<std::mutex> lock(g_envParticleMutex);
+        oldFog = g_fogRefs;
+    }
+    std::vector<FogRef> fog;
+    auto** objects = reinterpret_cast<void**>(g_gameBase + kGObjects);
+    const int n = GObjectCount();
+    for (int i = 0; i < n; ++i) {
+        void* obj = SafeGObjectAt(objects, i);
+        if (!obj || !IsReadableAddress(obj, 0x4C)) continue;
+        const uint32_t flags = Read<uint32_t>(obj, kUObjectFlags);
+        if (flags & kRF_ClassDefaultObject) continue;
+
+        if (g_classExponentialHeightFogComponent && IsA(obj, g_classExponentialHeightFogComponent) &&
+            g_fogStartDistanceOffset >= 0 && g_fogMaxOpacityOffset >= 0 && g_fogHeightFalloffOffset >= 0 &&
+            g_fogDensityOffset >= 0 && g_fogHeightOffset >= 0) {
+            auto rf = [&](int off, float& v)->bool { auto* p = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(obj)+off); if(!IsReadableAddress(p,4)) return false; v=*p; return std::isfinite(v); };
+            FogRef fr{}; fr.object=obj;
+            if (rf(g_fogStartDistanceOffset, fr.startDistance) && rf(g_fogMaxOpacityOffset, fr.maxOpacity) &&
+                rf(g_fogHeightFalloffOffset, fr.heightFalloff) && rf(g_fogDensityOffset, fr.density) && rf(g_fogHeightOffset, fr.height)) {
+                for (const auto& o : oldFog) if (o.object == obj) { fr = o; fr.object = obj; break; }
+                fog.push_back(fr);
+            }
+            continue;
+        }
+
+        continue;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_envParticleMutex);
+        g_fogRefs.swap(fog);
+        g_fogLiveCount.store(static_cast<int>(g_fogRefs.size()));
+    }
+    g_envParticleResolverReady.store(true);
+}
+
+void SetLocationParticleAmount(const wchar_t* label, std::vector<EnvParticleRef>& refs, int propertyOffset, int value) {
+    if (value < 0) value = 0;
+    int changed = 0;
+    std::lock_guard<std::mutex> lock(g_envParticleMutex);
+    for (auto& r : refs) {
+        auto* pCount = reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(r.object) + propertyOffset);
+        if (!BatLitNative::IsReadableAddress(pCount, sizeof(int))) continue;
+        *reinterpret_cast<volatile int*>(pCount) = value;
+        ++changed;
+    }
+    wchar_t msg[192]{};
+    swprintf_s(msg, L"ENV %s: ParticleCount=%d applied to %d live component(s)", label, value, changed);
+    Log(msg);
+}
+
+void ResetLocationParticleAmount(const wchar_t* label, std::vector<EnvParticleRef>& refs, int propertyOffset) {
+    int changed = 0;
+    std::lock_guard<std::mutex> lock(g_envParticleMutex);
+    for (auto& r : refs) {
+        auto* pCount = reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(r.object) + propertyOffset);
+        if (!BatLitNative::IsReadableAddress(pCount, sizeof(int))) continue;
+        *reinterpret_cast<volatile int*>(pCount) = r.originalCount;
+        ++changed;
+    }
+    wchar_t msg[192]{};
+    swprintf_s(msg, L"ENV %s: session/location defaults restored on %d live component(s)", label, changed);
+    Log(msg);
+}
+
+
+bool IsReadable(DWORD protect) {
+    if (protect & PAGE_GUARD) return false;
+    const DWORD p = protect & 0xff;
+    return p == PAGE_READONLY || p == PAGE_READWRITE || p == PAGE_WRITECOPY ||
+           p == PAGE_EXECUTE_READ || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
+}
+
+bool MatchPattern(const uint8_t* p, const uint8_t* pattern, const char* mask, size_t len) {
+    for (size_t i = 0; i < len; ++i) if (mask[i] == 'x' && p[i] != pattern[i]) return false;
+    return true;
+}
+
+uint8_t* ScanRegion(uintptr_t start, uintptr_t end, const uint8_t* pattern, const char* mask, size_t len, bool validateParticle = false) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    for (uintptr_t cur = start; cur < end;) {
+        if (!VirtualQuery(reinterpret_cast<void*>(cur), &mbi, sizeof(mbi))) { cur += 0x1000; continue; }
+        uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+        uintptr_t next = base + mbi.RegionSize;
+        if (next <= cur) break;
+        if (mbi.State == MEM_COMMIT && IsReadable(mbi.Protect)) {
+            uintptr_t a = (std::max)(base, start);
+            uintptr_t z = (std::min)(next, end);
+            if (z >= a + len) {
+                for (uintptr_t x = a; x + len <= z; ++x) {
+                    auto* p = reinterpret_cast<uint8_t*>(x);
+                    if (!MatchPattern(p, pattern, mask, len)) continue;
+                    if (validateParticle) {
+                        const int v = *reinterpret_cast<volatile int*>(p + 0x0C);
+                        if (v < 100 || v > 5000000) continue;
+                    }
+                    return p;
+                }
+            }
+        }
+        cur = next;
+    }
+    return nullptr;
+}
+
+uint8_t* ScanModule(HMODULE mod, const uint8_t* pattern, const char* mask, size_t len) {
+    if (!mod) return nullptr;
+    auto* base = reinterpret_cast<uint8_t*>(mod);
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+    return ScanRegion(reinterpret_cast<uintptr_t>(base), reinterpret_cast<uintptr_t>(base) + nt->OptionalHeader.SizeOfImage, pattern, mask, len);
+}
+
+float ReadCape(uint32_t off) {
+    const uintptr_t b = g_capeBase.load();
+    return b ? *reinterpret_cast<volatile float*>(b + off) : 0.0f;
+}
+void WriteCape(uint32_t off, float v) {
+    const uintptr_t b = g_capeBase.load();
+    if (b) *reinterpret_cast<volatile float*>(b + off) = v;
+}
+
+uint32_t ReadCapeFlags() {
+    const uintptr_t b = g_capeBase.load();
+    return b ? *reinterpret_cast<volatile uint32_t*>(b + 0x6C) : 0;
+}
+void WriteCapeFlags(uint32_t v) {
+    const uintptr_t b = g_capeBase.load();
+    if (b) *reinterpret_cast<volatile uint32_t*>(b + 0x6C) = v;
+}
+void EnableCapeWindOverride() {
+    uint32_t flags = ReadCapeFlags();
+    flags |= 0x00001000u; // bEnableWindEffect
+    flags |= 0x00002000u; // bOverrideWindDirection
+    WriteCapeFlags(flags);
+}
+
+void CaptureCapeDefaults() {
+    if (g_capeDefaults.valid || !g_capeBase.load()) return;
+    g_capeDefaults.flags = ReadCapeFlags();
+    g_capeDefaults.linearForceLimit = ReadCape(0xB0);
+    g_capeDefaults.linearStrength = ReadCape(0xB4);
+    g_capeDefaults.linearDamping = ReadCape(0xB8);
+    g_capeDefaults.angularForceLimit = ReadCape(0xBC);
+    g_capeDefaults.angularStrength = ReadCape(0xC0);
+    g_capeDefaults.angularDamping = ReadCape(0xC4);
+    g_capeDefaults.driveTolerance = ReadCape(0xC8);
+    g_capeDefaults.minRotVel = ReadCape(0xCC);
+    g_capeDefaults.forceStrengthMultiplier = ReadCape(0xD0);
+    g_capeDefaults.maxForceCap = ReadCape(0xD4);
+    g_capeDefaults.chainStrengthMin = ReadCape(0xD8);
+    g_capeDefaults.chainStrengthOverLength = ReadCape(0xDC);
+    g_capeDefaults.overstretchDistance = ReadCape(0xE0);
+    g_capeDefaults.minWindSpeed = ReadCape(0xE4);
+    g_capeDefaults.maxWindSpeed = ReadCape(0xE8);
+    g_capeDefaults.upwardsWindScale = ReadCape(0xEC);
+    g_capeDefaults.windX = ReadCape(0xF0);
+    g_capeDefaults.windY = ReadCape(0xF4);
+    g_capeDefaults.windZ = ReadCape(0xF8);
+    g_capeDefaults.springBlendSpeed = ReadCape(0xFC);
+    g_capeDefaults.runStartLength = ReadCape(0x100);
+    g_capeDefaults.runStartForce = ReadCape(0x104);
+    g_capeDefaults.runIncreaseRate = ReadCape(0x108);
+    g_capeDefaults.valid = true;
+}
+
+void CaptureRainDefaults() {
+    if (g_rainDefaults.valid || !g_rainEngine.load()) return;
+    const int v = *reinterpret_cast<volatile int*>(g_rainEngine.load());
+    if (v > 0 && v < 5000000) { g_rainDefaults.particleCount = v; g_rainDefaults.valid = true; }
+}
+
+void ResetCape() {
+    if (!g_capeDefaults.valid || !g_capeBase.load()) return;
+    WriteCapeFlags(g_capeDefaults.flags);
+    WriteCape(0xB0, g_capeDefaults.linearForceLimit);
+    WriteCape(0xB4, g_capeDefaults.linearStrength);
+    WriteCape(0xB8, g_capeDefaults.linearDamping);
+    WriteCape(0xBC, g_capeDefaults.angularForceLimit);
+    WriteCape(0xC0, g_capeDefaults.angularStrength);
+    WriteCape(0xC4, g_capeDefaults.angularDamping);
+    WriteCape(0xC8, g_capeDefaults.driveTolerance);
+    WriteCape(0xCC, g_capeDefaults.minRotVel);
+    WriteCape(0xD0, g_capeDefaults.forceStrengthMultiplier);
+    WriteCape(0xD4, g_capeDefaults.maxForceCap);
+    WriteCape(0xD8, g_capeDefaults.chainStrengthMin);
+    WriteCape(0xDC, g_capeDefaults.chainStrengthOverLength);
+    WriteCape(0xE0, g_capeDefaults.overstretchDistance);
+    WriteCape(0xE4, g_capeDefaults.minWindSpeed);
+    WriteCape(0xE8, g_capeDefaults.maxWindSpeed);
+    WriteCape(0xEC, g_capeDefaults.upwardsWindScale);
+    WriteCape(0xF0, g_capeDefaults.windX);
+    WriteCape(0xF4, g_capeDefaults.windY);
+    WriteCape(0xF8, g_capeDefaults.windZ);
+    WriteCape(0xFC, g_capeDefaults.springBlendSpeed);
+    WriteCape(0x100, g_capeDefaults.runStartLength);
+    WriteCape(0x104, g_capeDefaults.runStartForce);
+    WriteCape(0x108, g_capeDefaults.runIncreaseRate);
+}
+
+void SetRain(int v) {
+    if (v < 100) v = 100;
+    const uintptr_t engine = g_rainEngine.load();
+    if (!engine) {
+        Log(L"RAIN: ENGINE AOB address not ready");
+        return;
+    }
+    if (!BatLitNative::IsReadableAddress(reinterpret_cast<void*>(engine), sizeof(int))) {
+        Log(L"RAIN: ENGINE ParticleCount address unreadable");
+        return;
+    }
+
+    *reinterpret_cast<volatile int*>(engine) = v;
+
+    wchar_t msg[192]{};
+    swprintf_s(msg, L"RAIN: ParticleCount=%d written ENGINE ONLY @ 0x%llX (F5 to rebuild rain)",
+        v, (unsigned long long)engine);
+    Log(msg);
+}
+
+void ResetRain() { if (g_rainDefaults.valid) SetRain(g_rainDefaults.particleCount); }
+void ResetGlobal() { ResetCape(); ResetRain(); }
+
+bool InstallCapeResolverHook() {
+    HMODULE exe = GetModuleHandleW(L"BatmanAK.exe");
+    const uint8_t pattern[] = {0xF3,0x0F,0x10,0x83,0xE8,0x00,0x00,0x00,0xF3,0x0F,0x10,0x8B,0xE4,0x00,0x00,0x00,0x44,0x0F,0x2F,0xE9};
+    const char mask[] = "xxxxxxxxxxxxxxxxxxxx";
+    auto* site = ScanModule(exe, pattern, mask, sizeof(pattern));
+    if (!site) return false;
+
+    // Capture RBX, execute the original 16 bytes, return to site+16.
+    auto* stub = reinterpret_cast<uint8_t*>(VirtualAlloc(nullptr, 128, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!stub) return false;
+    size_t i = 0;
+    stub[i++] = 0x48; stub[i++] = 0xB8; // mov rax, &g_capeBase
+    const uint64_t addr = reinterpret_cast<uint64_t>(&g_capeBase);
+    memcpy(stub + i, &addr, 8); i += 8;
+    stub[i++] = 0x48; stub[i++] = 0x89; stub[i++] = 0x18; // mov [rax],rbx
+    memcpy(stub + i, site, 16); i += 16;
+    stub[i++] = 0x48; stub[i++] = 0xB8;
+    const uint64_t ret = reinterpret_cast<uint64_t>(site + 16);
+    memcpy(stub + i, &ret, 8); i += 8;
+    stub[i++] = 0xFF; stub[i++] = 0xE0;
+
+    DWORD old{};
+    if (!VirtualProtect(site, 16, PAGE_EXECUTE_READWRITE, &old)) return false;
+    uint8_t patch[16]{}; size_t p = 0;
+    patch[p++] = 0x48; patch[p++] = 0xB8;
+    const uint64_t dst = reinterpret_cast<uint64_t>(stub);
+    memcpy(patch + p, &dst, 8); p += 8;
+    patch[p++] = 0xFF; patch[p++] = 0xE0;
+    while (p < sizeof(patch)) patch[p++] = 0x90;
+    memcpy(site, patch, sizeof(patch));
+    VirtualProtect(site, 16, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), site, 16);
+    return true;
+}
+
+void ResolveRain() {
+    // Exact validated CE v0.5 WRITE_ENGINE_ONLY method:
+    //   Engine data : 0x0D000000..0x10000000
+    //   AOB         : FF FF 00 00 00 00 00 00 00 00 00 00 ?? ?? ?? ?? 00 00 80 44
+    //   RainEngineBase      = match - 0x210
+    //   Engine ParticleCount = RainEngineBase + 0x21C = match + 0x0C
+    static const uint8_t pattern[] = {
+        0xFF,0xFF,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        0x00,0x00,0x00,0x00,
+        0x00,0x00,0x80,0x44
+    };
+    static const char mask[] = "xxxxxxxxxxxx????xxxx";
+
+    uintptr_t engine = g_rainEngine.load();
+    if (!engine) {
+        if (auto* hit = ScanRegion(0x0D000000ull, 0x10000000ull, pattern, mask, sizeof(pattern), false)) {
+            const uintptr_t engineBase = reinterpret_cast<uintptr_t>(hit) - 0x210;
+            engine = engineBase + 0x21C;
+            g_rainEngine.store(engine);
+
+            wchar_t msg[256]{};
+            swprintf_s(msg, L"RAIN ENGINE ONLY: Base=0x%llX ParticleCount=0x%llX value=%d",
+                (unsigned long long)engineBase, (unsigned long long)engine,
+                *reinterpret_cast<volatile int*>(engine));
+            Log(msg);
+        }
+    }
+}
+
+
+bool LoadBackgroundFromResource(ID3D11Device* device, ID3D11ShaderResourceView** outSrv) {
+    *outSrv = nullptr;
+    HRSRC res = FindResourceW(g_module, MAKEINTRESOURCEW(IDR_BAT_BACKGROUND), MAKEINTRESOURCEW(10));
+    if (!res) return false;
+    HGLOBAL data = LoadResource(g_module, res);
+    if (!data) return false;
+    void* bytes = LockResource(data);
+    DWORD size = SizeofResource(g_module, res);
+    if (!bytes || !size) return false;
+
+    IWICImagingFactory* factory = nullptr;
+    IWICStream* stream = nullptr;
+    IWICBitmapDecoder* decoder = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICFormatConverter* converter = nullptr;
+    ID3D11Texture2D* tex = nullptr;
+
+    auto releaseAll = [&]() {
+        if (tex) tex->Release();
+        if (converter) converter->Release();
+        if (frame) frame->Release();
+        if (decoder) decoder->Release();
+        if (stream) stream->Release();
+        if (factory) factory->Release();
+    };
+
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) { releaseAll(); return false; }
+    if (FAILED(factory->CreateStream(&stream))) { releaseAll(); return false; }
+    if (FAILED(stream->InitializeFromMemory(reinterpret_cast<BYTE*>(bytes), size))) { releaseAll(); return false; }
+    if (FAILED(factory->CreateDecoderFromStream(stream, nullptr, WICDecodeMetadataCacheOnLoad, &decoder))) { releaseAll(); return false; }
+    if (FAILED(decoder->GetFrame(0, &frame))) { releaseAll(); return false; }
+    if (FAILED(factory->CreateFormatConverter(&converter))) { releaseAll(); return false; }
+    if (FAILED(converter->Initialize(frame, GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) { releaseAll(); return false; }
+
+    UINT w = 0, h = 0;
+    if (FAILED(converter->GetSize(&w, &h)) || !w || !h) { releaseAll(); return false; }
+    std::vector<uint8_t> pixels(static_cast<size_t>(w) * h * 4);
+    if (FAILED(converter->CopyPixels(nullptr, w * 4, static_cast<UINT>(pixels.size()), pixels.data()))) { releaseAll(); return false; }
+
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA sd{}; sd.pSysMem = pixels.data(); sd.SysMemPitch = w * 4;
+    if (FAILED(device->CreateTexture2D(&td, &sd, &tex))) { releaseAll(); return false; }
+    hr = device->CreateShaderResourceView(tex, nullptr, outSrv);
+    releaseAll();
+    return SUCCEEDED(hr);
+}
+void MaintainUiInputCapture();
+
+void CreateRenderTarget(IDXGISwapChain* swap) {
+    ID3D11Texture2D* backBuffer = nullptr;
+    if (SUCCEEDED(swap->GetBuffer(0, IID_PPV_ARGS(&backBuffer)))) {
+        g_device->CreateRenderTargetView(backBuffer, nullptr, &g_rtv);
+        backBuffer->Release();
+    }
+}
+
+void RebindGameWindowAfterResize(IDXGISwapChain* swap) {
+    if (!g_imguiReady || !swap) return;
+
+    DXGI_SWAP_CHAIN_DESC desc{};
+    if (FAILED(swap->GetDesc(&desc)) || !desc.OutputWindow) return;
+    HWND newHwnd = desc.OutputWindow;
+
+    // Restore the old window proc before binding ImGui to a recreated/replaced HWND.
+    if (g_hwnd && g_originalWndProc && IsWindow(g_hwnd)) {
+        const auto current = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(g_hwnd, GWLP_WNDPROC));
+        if (current == HookWndProc)
+            SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_originalWndProc));
+    }
+
+    ImGui_ImplWin32_Shutdown();
+
+    g_hwnd = newHwnd;
+    g_originalWndProc = reinterpret_cast<WNDPROC>(
+        SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(HookWndProc))
+    );
+    ImGui_ImplWin32_Init(g_hwnd);
+
+    // Force the next open-frame to capture the new resolution's cursor state,
+    // never restore the pre-resize ClipCursor rectangle.
+    g_savedClipValid = false;
+    g_inputCaptureActive = false;
+    MaintainUiInputCapture();
+    Log(L"ImGui Win32 binding refreshed after ResizeBuffers");
+}
+
+void BeginUiInputCapture() {
+    if (g_inputCaptureActive) return;
+    g_savedClipValid = GetClipCursor(&g_savedClipRect) != FALSE;
+    POINT pt{};
+    if (g_originalGetCursorPos ? g_originalGetCursorPos(&pt) : GetCursorPos(&pt)) {
+        g_gameFrozenCursor = pt;
+        g_gameFrozenCursorValid = true;
+    } else {
+        g_gameFrozenCursorValid = false;
+    }
+    g_inputCaptureActive = true;
+}
+
+void MaintainUiInputCapture() {
+    if (!g_imguiReady) return;
+
+    ImGuiIO& io = ImGui::GetIO();
+    const bool open = g_uiOpen.load();
+    io.MouseDrawCursor = open; // software cursor: survives resolution/fullscreen cursor hiding
+
+    if (open) {
+        BeginUiInputCapture();
+        ReleaseCapture();
+        if (g_originalClipCursor) g_originalClipCursor(nullptr); else ClipCursor(nullptr);
+        // The game may hide/re-own the OS cursor after a mode/resolution switch.
+        // ImGui draws its own cursor, but setting a normal cursor here also keeps
+        // Win32 cursor state sane for the current game HWND.
+        SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)));
+    } else if (g_inputCaptureActive) {
+        if (g_savedClipValid) { if (g_originalClipCursor) g_originalClipCursor(&g_savedClipRect); else ClipCursor(&g_savedClipRect); }
+        g_inputCaptureActive = false;
+        g_savedClipValid = false;
+        g_gameFrozenCursorValid = false;
+    }
+}
+
+bool IsBlockedGameInputMessage(UINT msg) {
+    switch (msg) {
+        // Raw input (important for Arkham Knight mouse/keyboard handling)
+        case WM_INPUT:
+        case WM_INPUT_DEVICE_CHANGE:
+
+        // Mouse
+        case WM_MOUSEMOVE:
+        case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
+        case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
+        case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MBUTTONDBLCLK:
+        case WM_XBUTTONDOWN: case WM_XBUTTONUP: case WM_XBUTTONDBLCLK:
+        case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
+
+        // Keyboard
+        case WM_KEYDOWN: case WM_KEYUP:
+        case WM_SYSKEYDOWN: case WM_SYSKEYUP:
+        case WM_CHAR: case WM_SYSCHAR:
+            return true;
+        default:
+            return false;
+    }
+}
+
+LRESULT CALLBACK HookWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_SIZE || msg == WM_DISPLAYCHANGE || msg == WM_DPICHANGED) {
+        // Any stale clip rectangle/capture from the previous resolution must die.
+        g_savedClipValid = false;
+        g_inputCaptureActive = false;
+        if (g_uiOpen.load()) {
+            ReleaseCapture();
+            ClipCursor(nullptr);
+        }
+    }
+
+    if (g_uiOpen.load()) {
+        // Let ImGui consume/update its own state first.
+        ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp);
+
+        // Never let Batman receive keyboard, mouse or RAWINPUT while the overlay is open.
+        if (IsBlockedGameInputMessage(msg)) return 1;
+
+        // Keep a usable cursor even when the game tries to own/hide it.
+        if (msg == WM_SETCURSOR) {
+            SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)));
+            return TRUE;
+        }
+    }
+
+    return CallWindowProcW(g_originalWndProc, hwnd, msg, wp, lp);
+}
+
+void DrawBackground() {
+    if (!g_backgroundSrv) return;
+    ImVec2 a = ImGui::GetWindowPos();
+    ImVec2 sz = ImGui::GetWindowSize();
+    ImVec2 b(a.x + sz.x, a.y + sz.y);
+    ImGui::GetWindowDrawList()->AddImage(reinterpret_cast<ImTextureID>(g_backgroundSrv), a, b, ImVec2(0,0), ImVec2(1,1), IM_COL32(255,255,255,105));
+}
+
+void DrawCapeTab() {
+    const uintptr_t base = g_capeBase.load();
+    if (!base) {
+        ImGui::TextColored(ImVec4(1,0.55f,0.25f,1), "Cape resolver: waiting for active RCapeStateConfig...");
+        return;
+    }
+
+    ImGui::TextDisabled("RCapeStateConfig: 0x%llX", static_cast<unsigned long long>(base));
+    ImGui::Spacing();
+
+    ImGui::TextUnformatted("Wind Direction");
+    ImGui::Separator();
+    ImGui::TextDisabled("Local-space direction. Editing X / Y / Z enables the cape wind override.");
+
+    float windX = ReadCape(0xF0);
+    float windY = ReadCape(0xF4);
+    float windZ = ReadCape(0xF8);
+
+    ImGui::SetNextItemWidth(220.0f * g_uiScale);
+    if (ImGui::DragFloat("Wind Direction X", &windX, 0.25f, -100.0f, 100.0f, "%.3f")) { EnableCapeWindOverride(); WriteCape(0xF0, windX); }
+    HelpMarker("Local-space X component of the cape wind-direction override.");
+
+    ImGui::SetNextItemWidth(220.0f * g_uiScale);
+    if (ImGui::DragFloat("Wind Direction Y", &windY, 0.25f, -100.0f, 100.0f, "%.3f")) { EnableCapeWindOverride(); WriteCape(0xF4, windY); }
+    HelpMarker("Local-space Y component of the cape wind-direction override.");
+
+    ImGui::SetNextItemWidth(220.0f * g_uiScale);
+    if (ImGui::DragFloat("Wind Direction Z", &windZ, 0.25f, -100.0f, 100.0f, "%.3f")) { EnableCapeWindOverride(); WriteCape(0xF8, windZ); }
+    HelpMarker("Local-space Z component of the cape wind-direction override.");
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Wind Speed");
+    ImGui::Separator();
+
+    float minWind = ReadCape(0xE4);
+    float maxWind = ReadCape(0xE8);
+    float upwardWind = ReadCape(0xEC);
+
+    ImGui::SetNextItemWidth(220.0f * g_uiScale);
+    if (ImGui::DragFloat("Minimum Wind Speed", &minWind, 1.0f, -5000.0f, 5000.0f, "%.1f")) WriteCape(0xE4, minWind);
+    HelpMarker("Lower bound of the wind speed used by the cape simulation.");
+
+    ImGui::SetNextItemWidth(220.0f * g_uiScale);
+    if (ImGui::DragFloat("Maximum Wind Speed", &maxWind, 1.0f, -5000.0f, 5000.0f, "%.1f")) WriteCape(0xE8, maxWind);
+    HelpMarker("Upper bound of the wind speed used by the cape simulation.");
+
+    ImGui::SetNextItemWidth(220.0f * g_uiScale);
+    if (ImGui::DragFloat("Upward Wind Scale", &upwardWind, 0.01f, -100.0f, 100.0f, "%.3f")) WriteCape(0xEC, upwardWind);
+    HelpMarker("Scales the upward component of the cape wind response.");
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Force");
+    ImGui::Separator();
+
+    float forceStrength = ReadCape(0xD0);
+    float maxForce = ReadCape(0xD4);
+
+    ImGui::SetNextItemWidth(220.0f * g_uiScale);
+    if (ImGui::DragFloat("Force Strength", &forceStrength, 0.01f, -100.0f, 100.0f, "%.3f")) WriteCape(0xD0, forceStrength);
+    HelpMarker("Global multiplier applied to cape forces.");
+
+    ImGui::SetNextItemWidth(220.0f * g_uiScale);
+    if (ImGui::DragFloat("Maximum Force", &maxForce, 0.1f, -10000.0f, 10000.0f, "%.2f")) WriteCape(0xD4, maxForce);
+    HelpMarker("Caps the maximum force applied to the cape.");
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Cape Response");
+    ImGui::Separator();
+
+    float chainMin = ReadCape(0xD8);
+    float chainOverLength = ReadCape(0xDC);
+    float overstretch = ReadCape(0xE0);
+
+    ImGui::SetNextItemWidth(220.0f * g_uiScale);
+    if (ImGui::DragFloat("Minimum Chain Force", &chainMin, 0.01f, -100.0f, 100.0f, "%.3f")) WriteCape(0xD8, chainMin);
+    HelpMarker("Minimum positional-force multiplier used along the cape chain.");
+
+    ImGui::SetNextItemWidth(220.0f * g_uiScale);
+    if (ImGui::DragFloat("Chain Force Along Cape", &chainOverLength, 0.01f, -100.0f, 100.0f, "%.3f")) WriteCape(0xDC, chainOverLength);
+    HelpMarker("Controls how positional force changes over the length of the cape.");
+
+    ImGui::SetNextItemWidth(220.0f * g_uiScale);
+    if (ImGui::DragFloat("Overstretch Distance", &overstretch, 0.1f, -10000.0f, 10000.0f, "%.2f")) WriteCape(0xE0, overstretch);
+    HelpMarker("Overrides the distance threshold used by overstretch handling.");
+
+    ImGui::Spacing();
+    if (ImGui::Button("Reset Cape")) ResetCape();
+    ImGui::SameLine();
+    ImGui::TextDisabled(g_capeDefaults.valid ? "startup/session values captured" : "waiting for startup values");
+}
+
+
+void SetFogValues(float startDistance, float maxOpacity, float heightFalloff, float density, float height) {
+    using namespace BatLitNative; int changed = 0; std::lock_guard<std::mutex> lock(g_envParticleMutex);
+    for (auto& r : g_fogRefs) { auto wf=[&](int off,float v){ auto* p=reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(r.object)+off); if(IsReadableAddress(p,4)) *reinterpret_cast<volatile float*>(p)=v; }; wf(g_fogStartDistanceOffset,startDistance); wf(g_fogMaxOpacityOffset,maxOpacity); wf(g_fogHeightFalloffOffset,heightFalloff); wf(g_fogDensityOffset,density); wf(g_fogHeightOffset,height); ++changed; }
+    wchar_t msg[192]{}; swprintf_s(msg,L"ENV Fog: values applied to %d live component(s)",changed); Log(msg);
+}
+
+void ResetFogValues() {
+    using namespace BatLitNative; int changed=0; std::lock_guard<std::mutex> lock(g_envParticleMutex);
+    for (auto& r : g_fogRefs) { auto wf=[&](int off,float v){ auto* p=reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(r.object)+off); if(IsReadableAddress(p,4)) *reinterpret_cast<volatile float*>(p)=v; }; wf(g_fogStartDistanceOffset,r.startDistance); wf(g_fogMaxOpacityOffset,r.maxOpacity); wf(g_fogHeightFalloffOffset,r.heightFalloff); wf(g_fogDensityOffset,r.density); wf(g_fogHeightOffset,r.height); ++changed; }
+    wchar_t msg[192]{}; swprintf_s(msg,L"ENV Fog: location defaults restored on %d live component(s)",changed); Log(msg);
+}
+
+bool SetFogEnabledImmediate(bool enabled) {
+    using namespace BatLitNative; int changed=0; std::lock_guard<std::mutex> lock(g_envParticleMutex); if (!g_fnFogSetEnabled) return false; struct PEnable { int32_t b{}; } pe{enabled?1:0};
+    for (auto& r : g_fogRefs) if (r.object && IsReadableAddress(r.object,0x80)) { ProcessScriptEvent(r.object,g_fnFogSetEnabled,&pe); ++changed; } return changed>0;
+}
+
+
+void QueueRadioModeEyes(bool enable) {
+    BatLitNative::g_radioEyesRequest.store(enable ? 1 : 0);
+}
+
+void DrawEnvironmentTab() {
+    if (ImGui::CollapsingHeader("Weather", ImGuiTreeNodeFlags_DefaultOpen)) {
+        static int rainAmount = 0, pollenAmount = 0, dustAmount = 0, snowAmount = 0;
+        static bool seededRain = false, seededPollen = false, seededDust = false, seededSnow = false;
+        {
+            std::lock_guard<std::mutex> lock(g_envParticleMutex);
+            auto seed = [&](bool& seeded, int& amount, const std::vector<EnvParticleRef>& refs, int off) {
+                if (seeded || refs.empty() || off < 0) return;
+                auto* pCount = reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(refs.front().object) + off);
+                if (BatLitNative::IsReadableAddress(pCount, 4)) { amount = *pCount; seeded = true; }
+            };
+            seed(seededRain, rainAmount, g_rainRefs, BatLitNative::g_rainParticleCountOffset);
+            seed(seededPollen, pollenAmount, g_pollenRefs, BatLitNative::g_pollenParticleCountOffset);
+            seed(seededDust, dustAmount, g_dustRefs, BatLitNative::g_dustParticleCountOffset);
+            seed(seededSnow, snowAmount, g_snowRefs, BatLitNative::g_snowParticleCountOffset);
+        }
+
+        auto drawWeatherRow = [&](const char* title, int& amount, int liveCount,
+                                  std::vector<EnvParticleRef>& refs, int offset, const wchar_t* logLabel) {
+            ImGui::PushID(title);
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted(title);
+            ImGui::SameLine(92.0f * g_uiScale);
+            if (!g_weatherParticleResolverReady.load() || offset < 0 || liveCount <= 0) {
+                ImGui::BeginDisabled();
+                int unavailable = amount;
+                ImGui::SetNextItemWidth(190.0f * g_uiScale);
+                ImGui::InputInt("##Amount", &unavailable, 500, 5000);
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                ImGui::TextDisabled("not active");
+            } else {
+                ImGui::SetNextItemWidth(190.0f * g_uiScale);
+                if (ImGui::InputInt("##Amount", &amount, 500, 5000)) {
+                    amount = (std::max)(0, amount);
+                    SetLocationParticleAmount(logLabel, refs, offset, amount);
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("%d live", liveCount);
+            }
+            ImGui::PopID();
+        };
+
+        drawWeatherRow("Rain", rainAmount, g_rainLiveCount.load(), g_rainRefs, BatLitNative::g_rainParticleCountOffset, L"Rain");
+        drawWeatherRow("Snow", snowAmount, g_snowLiveCount.load(), g_snowRefs, BatLitNative::g_snowParticleCountOffset, L"Snow");
+        drawWeatherRow("Dust", dustAmount, g_dustLiveCount.load(), g_dustRefs, BatLitNative::g_dustParticleCountOffset, L"Dust");
+        drawWeatherRow("Pollen", pollenAmount, g_pollenLiveCount.load(), g_pollenRefs, BatLitNative::g_pollenParticleCountOffset, L"Pollen");
+    }
+
+    if (ImGui::CollapsingHeader("Lightning", ImGuiTreeNodeFlags_DefaultOpen)) {
+        const std::wstring lightningStatus = BatLitNative::GetLightningStatus();
+        ImGui::TextWrapped("Status: %ls", lightningStatus.c_str());
+
+        ImGui::Checkbox("Randomize Screen Position", &BatLitNative::g_lightningRandomizePosition);
+        if (BatLitNative::g_lightningRandomizePosition) {
+            ImGui::SetNextItemWidth(180.0f * g_uiScale); ImGui::SliderFloat("Horizontal Spread", &BatLitNative::g_lightningSpreadX, 0.0f, 1.0f, "%.2f");
+            ImGui::SetNextItemWidth(180.0f * g_uiScale); ImGui::SliderFloat("Vertical Spread", &BatLitNative::g_lightningSpreadY, 0.0f, 1.0f, "%.2f");
+            ImGui::SetNextItemWidth(180.0f * g_uiScale); ImGui::SliderFloat("Distance Variation", &BatLitNative::g_lightningDistanceJitter, 0.0f, 0.50f, "%.2f");
+        }
+
+        if (ImGui::TreeNodeEx("Small Lightning", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::SetNextItemWidth(180.0f * g_uiScale); if (ImGui::InputFloat("Duration (s)##Small", &BatLitNative::g_smallLightningDuration, 0.1f, 1.0f, "%.2f") && BatLitNative::g_smallLightningDuration < 0.05f) BatLitNative::g_smallLightningDuration = 0.05f;
+            ImGui::SetNextItemWidth(180.0f * g_uiScale); ImGui::DragFloat("Distance##Small", &BatLitNative::g_smallLightningDistance, 50.0f, 100.0f, 50000.0f, "%.0f");
+            ImGui::InputInt("Instances##Small", &BatLitNative::g_smallLightningInstances, 1, 5); BatLitNative::g_smallLightningInstances = (std::max)(1, (std::min)(32, BatLitNative::g_smallLightningInstances));
+            ImGui::InputInt("Salvo Count##Small", &BatLitNative::g_smallLightningSalvoCount, 1, 5); BatLitNative::g_smallLightningSalvoCount = (std::max)(1, (std::min)(32, BatLitNative::g_smallLightningSalvoCount));
+            ImGui::SetNextItemWidth(180.0f * g_uiScale); ImGui::InputFloat("Salvo Interval (s)##Small", &BatLitNative::g_smallLightningSalvoInterval, 0.01f, 0.10f, "%.3f"); BatLitNative::g_smallLightningSalvoInterval = (std::max)(0.0f, (std::min)(5.0f, BatLitNative::g_smallLightningSalvoInterval));
+            ImGui::InputInt("Clusters##Small", &BatLitNative::g_smallLightningClusters, 1, 1); BatLitNative::g_smallLightningClusters = (std::max)(1, (std::min)(BatLitNative::g_smallLightningSalvoCount, BatLitNative::g_smallLightningClusters));
+            ImGui::SetNextItemWidth(180.0f * g_uiScale); ImGui::SliderFloat("Cluster Spread##Small", &BatLitNative::g_smallLightningClusterSpread, 0.0f, 0.50f, "%.2f");
+            if (ImGui::Button("Trigger Small Salvo")) {
+                BatLitNative::QueueLightningTrigger(false, BatLitNative::g_smallLightningDuration, BatLitNative::g_smallLightningDistance, BatLitNative::g_smallLightningInstances,
+                    BatLitNative::g_smallLightningSalvoCount, BatLitNative::g_smallLightningSalvoInterval, BatLitNative::g_smallLightningClusters, BatLitNative::g_smallLightningClusterSpread,
+                    BatLitNative::g_lightningRandomizePosition, BatLitNative::g_lightningSpreadX, BatLitNative::g_lightningSpreadY, BatLitNative::g_lightningDistanceJitter);
+            }
+            ImGui::TreePop();
+        }
+
+        if (ImGui::TreeNodeEx("Vertical / Big Lightning")) {
+            ImGui::SetNextItemWidth(180.0f * g_uiScale); if (ImGui::InputFloat("Duration (s)##Vertical", &BatLitNative::g_verticalLightningDuration, 0.1f, 1.0f, "%.2f") && BatLitNative::g_verticalLightningDuration < 0.05f) BatLitNative::g_verticalLightningDuration = 0.05f;
+            ImGui::SetNextItemWidth(180.0f * g_uiScale); ImGui::DragFloat("Distance##Vertical", &BatLitNative::g_verticalLightningDistance, 50.0f, 100.0f, 50000.0f, "%.0f");
+            ImGui::InputInt("Instances##Vertical", &BatLitNative::g_verticalLightningInstances, 1, 5); BatLitNative::g_verticalLightningInstances = (std::max)(1, (std::min)(32, BatLitNative::g_verticalLightningInstances));
+            ImGui::InputInt("Salvo Count##Vertical", &BatLitNative::g_verticalLightningSalvoCount, 1, 5); BatLitNative::g_verticalLightningSalvoCount = (std::max)(1, (std::min)(32, BatLitNative::g_verticalLightningSalvoCount));
+            ImGui::SetNextItemWidth(180.0f * g_uiScale); ImGui::InputFloat("Salvo Interval (s)##Vertical", &BatLitNative::g_verticalLightningSalvoInterval, 0.01f, 0.10f, "%.3f"); BatLitNative::g_verticalLightningSalvoInterval = (std::max)(0.0f, (std::min)(5.0f, BatLitNative::g_verticalLightningSalvoInterval));
+            ImGui::InputInt("Clusters##Vertical", &BatLitNative::g_verticalLightningClusters, 1, 1); BatLitNative::g_verticalLightningClusters = (std::max)(1, (std::min)(BatLitNative::g_verticalLightningSalvoCount, BatLitNative::g_verticalLightningClusters));
+            ImGui::SetNextItemWidth(180.0f * g_uiScale); ImGui::SliderFloat("Cluster Spread##Vertical", &BatLitNative::g_verticalLightningClusterSpread, 0.0f, 0.50f, "%.2f");
+            if (ImGui::Button("Trigger Vertical Salvo")) {
+                BatLitNative::QueueLightningTrigger(true, BatLitNative::g_verticalLightningDuration, BatLitNative::g_verticalLightningDistance, BatLitNative::g_verticalLightningInstances,
+                    BatLitNative::g_verticalLightningSalvoCount, BatLitNative::g_verticalLightningSalvoInterval, BatLitNative::g_verticalLightningClusters, BatLitNative::g_verticalLightningClusterSpread,
+                    BatLitNative::g_lightningRandomizePosition, BatLitNative::g_lightningSpreadX, BatLitNative::g_lightningSpreadY, BatLitNative::g_lightningDistanceJitter);
+            }
+            ImGui::TreePop();
+        }
+    }
+
+    if (ImGui::CollapsingHeader("Misc", ImGuiTreeNodeFlags_DefaultOpen)) {
+        static bool radioModeEyes = false;
+        static bool gauntletLight = false;
+        static bool vehicles = false;
+        static bool vehiclesOnFire = false;
+        static bool combatVfx = true;
+
+        if (ImGui::Checkbox("Radio Mode Eyes", &radioModeEyes))
+            QueueRadioModeEyes(radioModeEyes);
+
+        if (ImGui::Checkbox("Gauntlet Light", &gauntletLight))
+            BatLitNative::QueueConsoleCommand(gauntletLight ?
+                L"set BmGame.RPawnPlayerBmBase bGauntletLightRunning true" :
+                L"set BmGame.RPawnPlayerBmBase bGauntletLightRunning false");
+
+        if (ImGui::Checkbox("Vehicles", &vehicles)) {
+            BatLitNative::QueueConsoleCommand(vehicles ? L"set BmGame.RAbandonedVehicle HeadlightsSwitchedOn 1" : L"set BmGame.RAbandonedVehicle HeadlightsSwitchedOn 0");
+            BatLitNative::QueueConsoleCommand(vehicles ? L"set BmGame.RAbandonedVehicle InteriorLightsSwitchedOn 1" : L"set BmGame.RAbandonedVehicle InteriorLightsSwitchedOn 0");
+            BatLitNative::QueueConsoleCommand(vehicles ? L"set BmGame.RAbandonedVehicle AuxLightsSwitchedOn 1" : L"set BmGame.RAbandonedVehicle AuxLightsSwitchedOn 0");
+            BatLitNative::QueueConsoleCommand(vehicles ? L"set BmGame.RAbandonedVehicle HazardLightsSwitchedOn 1" : L"set BmGame.RAbandonedVehicle HazardLightsSwitchedOn 0");
+        }
+
+        if (ImGui::Checkbox("Vehicles On Fire", &vehiclesOnFire))
+            BatLitNative::QueueConsoleCommand(vehiclesOnFire ?
+                L"set BmGame.RAbandonedVehicle bOnFire true" :
+                L"set BmGame.RAbandonedVehicle bOnFire false");
+
+        if (ImGui::Checkbox("Combat VFX", &combatVfx)) {
+            BatLitNative::QueueConsoleCommand(combatVfx ?
+                L"set BmGame.RPersistentDebugData Debug_Combat_DisableStrikeTrails false" :
+                L"set BmGame.RPersistentDebugData Debug_Combat_DisableStrikeTrails true");
+            BatLitNative::QueueConsoleCommand(combatVfx ?
+                L"set BmGame.RPersistentDebugData Debug_Combat_DisableImpactVFX 0" :
+                L"set BmGame.RPersistentDebugData Debug_Combat_DisableImpactVFX 1");
+        }
+    }
+}
+
+
+void DrawBatLitEditor(BatLitNative::LightRecord& rec) {
+    if (!rec.editOpen) { rec.editorLoggedOpen = false; return; }
+    if (!rec.editorLoggedOpen) {
+        BatLitNative::LogLightRecord(L"DrawEditor entered", rec);
+        rec.editorLoggedOpen = true;
+    }
+    std::string title = rec.name + " - Edit##BatLit_" + std::to_string(rec.id);
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const ImVec2 workSize = viewport ? viewport->WorkSize : ImGui::GetIO().DisplaySize;
+    const ImVec2 workPos = viewport ? viewport->WorkPos : ImVec2(0.0f, 0.0f);
+    const ImVec2 wantedSize(610.0f * g_uiScale, 700.0f * g_uiScale);
+    const ImVec2 editorSize(
+        (wantedSize.x < workSize.x - 40.0f) ? wantedSize.x : (workSize.x - 40.0f),
+        (wantedSize.y < workSize.y - 40.0f) ? wantedSize.y : (workSize.y - 40.0f));
+    ImGui::SetNextWindowSize(editorSize, ImGuiCond_Appearing);
+    ImGui::SetNextWindowPos(ImVec2(workPos.x + workSize.x * 0.5f, workPos.y + workSize.y * 0.5f),
+                            ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (!ImGui::Begin(title.c_str(), &rec.editOpen, ImGuiWindowFlags_NoCollapse)) { ImGui::End(); return; }
+
+    auto& st = rec.state;
+    ImGui::TextDisabled("Actor: 0x%llX   Component: 0x%llX", (unsigned long long)rec.actor, (unsigned long long)rec.component);
+    if (rec.statePending) ImGui::TextDisabled("Initializing spawned light state...");
+    if (!rec.valid) ImGui::TextColored(ImVec4(1,0.35f,0.25f,1), "Light is no longer valid.");
+
+    if (ImGui::Button("Apply")) { BatLitNative::LogLightRecord(L"Editor Apply clicked", rec); BatLitNative::Queue(BatLitNative::CommandType::Apply, rec.id); }
+    ImGui::SameLine();
+    if (ImGui::Button("Move to Camera")) { BatLitNative::LogLightRecord(L"Move to Camera clicked", rec); BatLitNative::Queue(BatLitNative::CommandType::MoveToCamera, rec.id); }
+    ImGui::SameLine();
+    if (ImGui::Button("Reset")) BatLitNative::Queue(BatLitNative::CommandType::Reset, rec.id);
+    ImGui::Separator();
+
+    if (ImGui::CollapsingHeader("Light", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::Checkbox("Enabled", &st.enabled)) BatLitNative::Queue(BatLitNative::CommandType::ToggleEnabled, rec.id, st.enabled);
+        ImGui::ColorEdit3("Color", st.color);
+        ImGui::DragFloat("Intensity", &st.intensity, 0.05f, 0.0f, 100000.0f, "%.3f");
+        ImGui::DragFloat("Radius", &st.radius, 1.0f, 0.0f, 1000000.0f, "%.1f");
+        ImGui::DragFloat("Light Bulb Radius", &st.lightBulbRadius, 0.1f, 0.0f, 100000.0f, "%.2f");
+        ImGui::DragFloat("Falloff Exponent", &st.falloffExponent, 0.01f, -1000.0f, 1000.0f, "%.3f");
+        ImGui::Checkbox("Quadratic Falloff", &st.quadraticFalloff);
+    }
+
+    if (ImGui::CollapsingHeader("Position and Rotation", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::DragFloat("X", &st.translation.x, 1.0f, -1000000.0f, 1000000.0f, "%.1f");
+        ImGui::DragFloat("Y", &st.translation.y, 1.0f, -1000000.0f, 1000000.0f, "%.1f");
+        ImGui::DragFloat("Z", &st.translation.z, 1.0f, -1000000.0f, 1000000.0f, "%.1f");
+
+        if (rec.isSpot) {
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::DragFloat("Pitch", &st.pitch, 0.25f, -360.0f, 360.0f, "%.2f deg");
+            ImGui::DragFloat("Yaw", &st.yaw, 0.25f, -360.0f, 360.0f, "%.2f deg");
+            ImGui::DragFloat("Roll", &st.roll, 0.25f, -360.0f, 360.0f, "%.2f deg");
+            ImGui::Checkbox("Absolute Rotation", &st.absoluteRotation);
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::DragFloat("Inner Cone", &st.innerConeAngle, 0.1f, 0.0f, 180.0f, "%.2f deg");
+            ImGui::DragFloat("Outer Cone", &st.outerConeAngle, 0.1f, 0.0f, 180.0f, "%.2f deg");
+            ImGui::DragFloat("Light Shaft Cone", &st.lightShaftConeAngle, 0.1f, -360.0f, 360.0f, "%.2f deg");
+        }
+    }
+
+    // Shadows and advanced experimental light sections are intentionally hidden from the UI.
+    // Their state fields remain in the backend for compatibility while BatLit is cleaned up.
+
+
+    ImGui::Separator();
+    if (ImGui::Button("Apply##bottom")) { BatLitNative::LogLightRecord(L"Editor Apply bottom clicked", rec); BatLitNative::Queue(BatLitNative::CommandType::Apply, rec.id); }
+    ImGui::SameLine(); ImGui::TextDisabled("Changes are stored independently for this light.");
+    ImGui::End();
+}
+
+void DrawBatLitTab() {
+    ImGui::TextUnformatted("BatLit");
+    ImGui::TextDisabled("Native light manager - one record per spawned light.");
+
+    ImGui::Checkbox("Show Light Gizmo", &g_showLightGizmo);
+    if (g_showLightGizmo) {
+        ImGui::SameLine(); ImGui::Checkbox("Radius", &g_showGizmoRadius);
+        ImGui::SameLine(); ImGui::Checkbox("Axis", &g_showGizmoAxis);
+        ImGui::SameLine(); ImGui::Checkbox("Cone", &g_showGizmoCone);
+    }
+
+    if (ImGui::CollapsingHeader("Exposure", ImGuiTreeNodeFlags_DefaultOpen)) {
+        bool enabled = g_exposureWanted.load();
+        if (ImGui::Checkbox("Exposure Override", &enabled))
+            g_exposureWanted.store(enabled);
+
+        float exposure = g_exposureValue.load();
+        const bool applied = g_exposureApplied.load();
+        if (!applied) ImGui::BeginDisabled();
+        ImGui::SetNextItemWidth(220.0f * g_uiScale);
+        if (ImGui::DragFloat("Exposure Base Offset", &exposure, 0.05f, -10.0f, 10.0f, "%.3f"))
+            g_exposureValue.store(exposure);
+        if (!applied) ImGui::EndDisabled();
+
+        ImGui::SameLine();
+        if (ImGui::Button("Reset Exposure")) g_exposureWanted.store(false);
+
+        if (enabled && !applied)
+            ImGui::TextDisabled("Resolving LocalPlayer / enabling LevelPP override...");
+        else if (applied)
+            ImGui::TextDisabled("LevelPP only - LocalPlayer + 0x474; CurrentPP writer remains untouched.");
+        else
+            ImGui::TextDisabled("Game-controlled exposure. Enable override to edit BaseOffset.");
+        ImGui::Spacing();
+        ImGui::Separator();
+    }
+    if (ImGui::Button("Create Spot")) BatLitNative::Queue(BatLitNative::CommandType::SpawnSpot);
+    ImGui::SameLine();
+    if (ImGui::Button("Create Point")) BatLitNative::Queue(BatLitNative::CommandType::SpawnPoint);
+    ImGui::Spacing();
+    ImGui::Separator();
+
+    std::lock_guard<std::mutex> lock(BatLitNative::g_lightMutex);
+    if (BatLitNative::g_lights.empty()) {
+        ImGui::TextDisabled("No BatLit lights yet.");
+        ImGui::TextDisabled("Create a Spot or Point light; it will appear here as a separate record.");
+        return;
+    }
+    for (auto& rec : BatLitNative::g_lights) {
+        ImGui::PushID((int)rec.id);
+        ImGui::TextUnformatted(rec.name.c_str());
+        if (rec.statePending) { ImGui::SameLine(); ImGui::TextDisabled("(initializing)"); }
+        ImGui::SameLine(170.0f * g_uiScale);
+        if (ImGui::Button("Edit")) {
+            rec.editOpen = true;
+            BatLitNative::LogLightRecord(L"Edit clicked", rec);
+        }
+        ImGui::SameLine();
+        bool enabled = rec.state.enabled;
+        if (ImGui::Checkbox("Enabled", &enabled)) {
+            rec.state.enabled = enabled;
+            BatLitNative::Queue(BatLitNative::CommandType::ToggleEnabled, rec.id, enabled);
+        }
+        ImGui::SameLine();
+        ImGui::Checkbox("Gizmo", &rec.gizmoVisible);
+        ImGui::SameLine();
+        ImGui::TextDisabled("Intensity %.2f", rec.state.intensity);
+        ImGui::PopID();
+    }
+}
+
+void DrawBatLitEditors() {
+    std::lock_guard<std::mutex> lock(BatLitNative::g_lightMutex);
+    for (auto& rec : BatLitNative::g_lights) DrawBatLitEditor(rec);
+}
+
+static float Dot3(const BatLitNative::Vec3& a, const BatLitNative::Vec3& b) {
+    return a.x*b.x + a.y*b.y + a.z*b.z;
+}
+
+static BatLitNative::Vec3 Sub3(const BatLitNative::Vec3& a, const BatLitNative::Vec3& b) {
+    return {a.x-b.x, a.y-b.y, a.z-b.z};
+}
+
+static BatLitNative::Vec3 AddScaled3(const BatLitNative::Vec3& a, const BatLitNative::Vec3& d, float scale) {
+    return {a.x+d.x*scale, a.y+d.y*scale, a.z+d.z*scale};
+}
+
+static BatLitNative::Vec3 Add3(const BatLitNative::Vec3& a, const BatLitNative::Vec3& b) {
+    return {a.x+b.x, a.y+b.y, a.z+b.z};
+}
+
+static BatLitNative::Vec3 Mul3(const BatLitNative::Vec3& a, float s) {
+    return {a.x*s, a.y*s, a.z*s};
+}
+
+static BatLitNative::Vec3 Cross3(const BatLitNative::Vec3& a, const BatLitNative::Vec3& b) {
+    return {
+        a.y*b.z - a.z*b.y,
+        a.z*b.x - a.x*b.z,
+        a.x*b.y - a.y*b.x
+    };
+}
+
+static float Length3(const BatLitNative::Vec3& v) {
+    return sqrtf(Dot3(v, v));
+}
+
+static BatLitNative::Vec3 Normalize3(const BatLitNative::Vec3& v) {
+    const float len = Length3(v);
+    if (len <= 0.00001f) return {0.0f, 0.0f, 0.0f};
+    return {v.x/len, v.y/len, v.z/len};
+}
+
+static void MakePerpendicularBasis(
+    const BatLitNative::Vec3& forward,
+    BatLitNative::Vec3& outRight,
+    BatLitNative::Vec3& outUp)
+{
+    // IMPORTANT: this basis is derived ONLY from the light direction and world axes.
+    // It must never use the camera right/up vectors, otherwise the gizmo rotates with camera.
+    const BatLitNative::Vec3 f = Normalize3(forward);
+    const BatLitNative::Vec3 worldUp =
+        (fabsf(f.z) < 0.98f) ? BatLitNative::Vec3{0.0f, 0.0f, 1.0f}
+                             : BatLitNative::Vec3{0.0f, 1.0f, 0.0f};
+
+    outRight = Normalize3(Cross3(worldUp, f));
+    outUp = Normalize3(Cross3(f, outRight));
+}
+
+struct GizmoCamera;
+static bool ProjectGizmoPoint(const GizmoCamera& cam, const BatLitNative::Vec3& world, ImVec2& screen, float* depthOut = nullptr);
+
+static void DrawWorldCircle(
+    ImDrawList* dl,
+    const GizmoCamera& cam,
+    const BatLitNative::Vec3& center,
+    const BatLitNative::Vec3& axisA,
+    const BatLitNative::Vec3& axisB,
+    float radius,
+    ImU32 color,
+    int segments = 48,
+    float thickness = 1.0f)
+{
+    ImVec2 first{};
+    ImVec2 prev{};
+    bool firstValid = false;
+    bool prevValid = false;
+
+    for (int i = 0; i <= segments; ++i) {
+        const float a = (static_cast<float>(i) / static_cast<float>(segments)) * 6.28318530717958647692f;
+        const BatLitNative::Vec3 world =
+            Add3(center, Add3(Mul3(axisA, cosf(a) * radius), Mul3(axisB, sinf(a) * radius)));
+
+        ImVec2 cur{};
+        const bool valid = ProjectGizmoPoint(cam, world, cur);
+
+        if (valid) {
+            if (!firstValid) {
+                first = cur;
+                firstValid = true;
+            }
+            if (prevValid)
+                dl->AddLine(prev, cur, color, thickness);
+            prev = cur;
+            prevValid = true;
+        } else {
+            prevValid = false;
+        }
+    }
+}
+
+static BatLitNative::Vec3 DegreesForward(float pitchDeg, float yawDeg) {
+    const float p = pitchDeg * 3.14159265358979323846f / 180.0f;
+    const float y = yawDeg   * 3.14159265358979323846f / 180.0f;
+    const float cp = cosf(p), sp = sinf(p), cy = cosf(y), sy = sinf(y);
+    return {cp*cy, cp*sy, sp};
+}
+
+struct GizmoCamera {
+    BatLitNative::Vec3 pos{};
+    BatLitNative::Vec3 forward{};
+    BatLitNative::Vec3 right{};
+    BatLitNative::Vec3 up{};
+    float focal{};
+    ImVec2 center{};
+};
+
+static bool GetGizmoCamera(GizmoCamera& out) {
+    void* pc = BatLitNative::g_lastPlayerController;
+    if (!pc || !BatLitNative::IsReadableAddress(pc, BatLitNative::kPlayerControllerPlayerCamera + sizeof(void*))) return false;
+    void* camera = BatLitNative::Read<void*>(pc, BatLitNative::kPlayerControllerPlayerCamera);
+    const ptrdiff_t pov = BatLitNative::kCameraCache + BatLitNative::kCameraCachePOV;
+    if (!camera || !BatLitNative::IsReadableAddress(reinterpret_cast<uint8_t*>(camera) + pov, 28)) return false;
+
+    const BatLitNative::Vec3 pos = BatLitNative::Read<BatLitNative::Vec3>(camera, pov + 0x00);
+    const BatLitNative::RotatorRaw rr = BatLitNative::Read<BatLitNative::RotatorRaw>(camera, pov + 0x0C);
+    const float fov = BatLitNative::Read<float>(camera, pov + 0x18);
+    if (!std::isfinite(fov) || fov < 1.0f || fov > 179.0f) return false;
+
+    const float pitch = BatLitNative::RuuToDegrees(rr.pitch) * 3.14159265358979323846f / 180.0f;
+    const float yaw   = BatLitNative::RuuToDegrees(rr.yaw)   * 3.14159265358979323846f / 180.0f;
+    const float roll  = BatLitNative::RuuToDegrees(rr.roll)  * 3.14159265358979323846f / 180.0f;
+    const float cp = cosf(pitch), sp = sinf(pitch), cy = cosf(yaw), sy = sinf(yaw);
+    const float cr = cosf(roll), sr = sinf(roll);
+    out.pos = pos;
+    out.forward = {cp*cy, cp*sy, sp};
+    const BatLitNative::Vec3 baseRight{-sy, cy, 0.0f};
+    const BatLitNative::Vec3 baseUp{-sp*cy, -sp*sy, cp};
+    out.right = {baseRight.x*cr + baseUp.x*sr, baseRight.y*cr + baseUp.y*sr, baseRight.z*cr + baseUp.z*sr};
+    out.up = {baseUp.x*cr - baseRight.x*sr, baseUp.y*cr - baseRight.y*sr, baseUp.z*cr - baseRight.z*sr};
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    out.center = ImVec2(display.x * 0.5f, display.y * 0.5f);
+    out.focal = display.x * 0.5f / tanf((fov * 0.5f) * 3.14159265358979323846f / 180.0f);
+    return display.x > 1.0f && display.y > 1.0f;
+}
+
+static bool ProjectGizmoPoint(const GizmoCamera& cam, const BatLitNative::Vec3& world, ImVec2& screen, float* depthOut) {
+    const BatLitNative::Vec3 d = Sub3(world, cam.pos);
+    const float depth = Dot3(d, cam.forward);
+    if (depth <= 1.0f) return false;
+    const float sx = Dot3(d, cam.right);
+    const float sy = Dot3(d, cam.up);
+    screen.x = cam.center.x + (sx / depth) * cam.focal;
+    screen.y = cam.center.y - (sy / depth) * cam.focal;
+    if (depthOut) *depthOut = depth;
+    return std::isfinite(screen.x) && std::isfinite(screen.y);
+}
+
+static void DrawOneLightGizmo(
+    const GizmoCamera& cam,
+    const BatLitNative::LightRecord& rec,
+    ImDrawList* dl)
+{
+    if (!rec.gizmoVisible || !rec.valid || !rec.actor)
+        return;
+
+    if (!BatLitNative::IsReadableAddress(
+            reinterpret_cast<uint8_t*>(rec.actor) + BatLitNative::kActorLocation,
+            sizeof(BatLitNative::Vec3)))
+        return;
+
+    const BatLitNative::Vec3 pos =
+        BatLitNative::Read<BatLitNative::Vec3>(rec.actor, BatLitNative::kActorLocation);
+
+    ImVec2 p{};
+    float depth = 0.0f;
+    if (!ProjectGizmoPoint(cam, pos, p, &depth))
+        return;
+
+    // Gizmo colors:
+    //   RED   = forward direction / where the light points
+    //   BLUE  = Spot angle / cone
+    //   GRAY  = Point Light radius
+    //   WHITE = light origin
+    const ImU32 originCol = IM_COL32(245,245,245,255);
+    const ImU32 axisCol   = IM_COL32(235,65,65,255);
+    const ImU32 coneCol   = IM_COL32(70,145,255,245);
+    const ImU32 radiusCol = IM_COL32(145,145,145,210);
+
+    const float cross = 9.0f;
+    dl->AddCircleFilled(p, 5.0f, originCol, 16);
+    dl->AddLine(ImVec2(p.x-cross,p.y), ImVec2(p.x+cross,p.y), originCol, 2.0f);
+    dl->AddLine(ImVec2(p.x,p.y-cross), ImVec2(p.x,p.y+cross), originCol, 2.0f);
+
+    // Point Light only: spherical influence radius.
+    if (!rec.isSpot && g_showGizmoRadius && rec.state.radius > 0.0f) {
+        const BatLitNative::Vec3 wx{1.0f, 0.0f, 0.0f};
+        const BatLitNative::Vec3 wy{0.0f, 1.0f, 0.0f};
+        const BatLitNative::Vec3 wz{0.0f, 0.0f, 1.0f};
+
+        DrawWorldCircle(dl, cam, pos, wx, wy, rec.state.radius, radiusCol, 48, 2.0f);
+        DrawWorldCircle(dl, cam, pos, wx, wz, rec.state.radius, radiusCol, 48, 2.0f);
+        DrawWorldCircle(dl, cam, pos, wy, wz, rec.state.radius, radiusCol, 48, 2.0f);
+    }
+
+    // Spot Light: direction + cone only. No radius sphere.
+    if (rec.isSpot && (g_showGizmoAxis || g_showGizmoCone)) {
+        float pitch = rec.state.pitch;
+        float yaw = rec.state.yaw;
+
+        if (!rec.state.absoluteRotation &&
+            BatLitNative::IsReadableAddress(
+                reinterpret_cast<uint8_t*>(rec.actor) + BatLitNative::kActorRotation,
+                sizeof(BatLitNative::RotatorRaw)))
+        {
+            const BatLitNative::RotatorRaw ar =
+                BatLitNative::Read<BatLitNative::RotatorRaw>(
+                    rec.actor, BatLitNative::kActorRotation);
+            pitch += BatLitNative::RuuToDegrees(ar.pitch);
+            yaw   += BatLitNative::RuuToDegrees(ar.yaw);
+        }
+
+        const BatLitNative::Vec3 dir = Normalize3(DegreesForward(pitch, yaw));
+        const float axisLen =
+            (std::max)(100.0f, (std::min)(rec.state.radius, 5000.0f));
+        const BatLitNative::Vec3 end = AddScaled3(pos, dir, axisLen);
+
+        ImVec2 e{};
+        if (ProjectGizmoPoint(cam, end, e)) {
+            if (g_showGizmoAxis)
+                dl->AddLine(p, e, axisCol, 3.0f);
+
+            if (g_showGizmoCone) {
+                const float angle =
+                    std::clamp(rec.state.outerConeAngle, 0.1f, 89.0f) *
+                    3.14159265358979323846f / 180.0f;
+                const float coneRadius = tanf(angle) * axisLen;
+
+                BatLitNative::Vec3 coneRight{}, coneUp{};
+                MakePerpendicularBasis(dir, coneRight, coneUp);
+
+                DrawWorldCircle(
+                    dl, cam, end, coneRight, coneUp,
+                    coneRadius, coneCol, 48, 2.5f);
+
+                const BatLitNative::Vec3 rim0 =
+                    AddScaled3(end, coneRight,  coneRadius);
+                const BatLitNative::Vec3 rim1 =
+                    AddScaled3(end, coneRight, -coneRadius);
+                const BatLitNative::Vec3 rim2 =
+                    AddScaled3(end, coneUp,     coneRadius);
+                const BatLitNative::Vec3 rim3 =
+                    AddScaled3(end, coneUp,    -coneRadius);
+
+                for (const auto& rim : {rim0, rim1, rim2, rim3}) {
+                    ImVec2 rp{};
+                    if (ProjectGizmoPoint(cam, rim, rp))
+                        dl->AddLine(p, rp, coneCol, 2.0f);
+                }
+            }
+        }
+    }
+
+    char label[96]{};
+    if (rec.isSpot)
+        snprintf(label, sizeof(label), "%s", rec.name.c_str());
+    else
+        snprintf(label, sizeof(label), "%s  R %.0f", rec.name.c_str(), rec.state.radius);
+
+    dl->AddText(ImVec2(p.x + 10.0f, p.y + 8.0f), originCol, label);
+}
+
+bool HasVisibleLightGizmos() {
+    if (!g_showLightGizmo)
+        return false;
+
+    std::lock_guard<std::mutex> lock(BatLitNative::g_lightMutex);
+    for (const auto& rec : BatLitNative::g_lights) {
+        if (rec.gizmoVisible && rec.valid && rec.actor)
+            return true;
+    }
+    return false;
+}
+
+void DrawLightGizmos() {
+    if (!g_showLightGizmo)
+        return;
+
+    GizmoCamera cam{};
+    if (!GetGizmoCamera(cam))
+        return;
+
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+
+    std::lock_guard<std::mutex> lock(BatLitNative::g_lightMutex);
+    for (const auto& rec : BatLitNative::g_lights)
+        DrawOneLightGizmo(cam, rec, dl);
+}
+
+
+
+void DrawAboutTab() {
+    ImGui::TextUnformatted("Shortcuts");
+    ImGui::Separator();
+
+    bool hotkeysChanged = false;
+    hotkeysChanged |= DrawHotkeyCapture("Open / Close UI", 1, g_hotkeyToggleUI);
+    hotkeysChanged |= DrawHotkeyCapture("Small Lightning", 2, g_hotkeySmallLightning);
+    hotkeysChanged |= DrawHotkeyCapture("Vertical / Big Lightning", 3, g_hotkeyVerticalLightning);
+
+    if (hotkeysChanged)
+        SaveHotkeyConfig();
+
+    if (g_hotkeyToggleUI == g_hotkeySmallLightning ||
+        g_hotkeyToggleUI == g_hotkeyVerticalLightning ||
+        g_hotkeySmallLightning == g_hotkeyVerticalLightning) {
+        ImGui::TextDisabled("Warning: two actions currently use the same key.");
+    }
+
+    ImGui::TextDisabled("Click Change, then press any keyboard key.");
+    ImGui::TextDisabled("Saved automatically to BAKTweaks.ini");
+    ImGui::Spacing();
+
+    ImGui::TextUnformatted("BAT TWEAKS");
+    ImGui::Separator();
+    ImGui::TextWrapped("Batman: Arkham Knight runtime visual and physics tweaks.");
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Cape Controls");
+    ImGui::Separator();
+
+    ImGui::TextUnformatted("Wind Direction X / Y / Z");
+    ImGui::TextDisabled("Overrides the local-space wind direction applied to the cape.");
+
+    ImGui::TextUnformatted("Minimum Wind Speed");
+    ImGui::TextDisabled("Lower bound of the wind speed used by the cape simulation.");
+
+    ImGui::TextUnformatted("Maximum Wind Speed");
+    ImGui::TextDisabled("Upper bound of the wind speed used by the cape simulation.");
+
+    ImGui::TextUnformatted("Upward Wind Scale");
+    ImGui::TextDisabled("Scales the upward component of the cape wind response.");
+
+    ImGui::TextUnformatted("Force Strength");
+    ImGui::TextDisabled("Global multiplier applied to cape forces.");
+
+    ImGui::TextUnformatted("Maximum Force");
+    ImGui::TextDisabled("Caps the maximum force applied to the cape.");
+
+    ImGui::TextUnformatted("Minimum Chain Force");
+    ImGui::TextDisabled("Minimum positional-force multiplier used along the cape chain.");
+
+    ImGui::TextUnformatted("Chain Force Along Cape");
+    ImGui::TextDisabled("Controls how positional force changes over the length of the cape.");
+
+    ImGui::TextUnformatted("Overstretch Distance");
+    ImGui::TextDisabled("Overrides the distance threshold used by overstretch handling.");
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("BatLit / Lighting");
+    ImGui::Separator();
+
+    ImGui::TextWrapped("BatLit creates independent runtime Point and Spot lights. Each created light gets its own editor, so color, intensity, radius and placement can be adjusted without changing the other BatLit lights.");
+
+    ImGui::TextUnformatted("Create Spot / Create Point");
+    ImGui::TextDisabled("Spot lights are directional and use cone angles. Point lights emit in every direction and do not use Spot cone controls.");
+
+    ImGui::TextUnformatted("Enabled");
+    ImGui::TextDisabled("Turns the selected light on or off without deleting its BatLit record.");
+
+    ImGui::TextUnformatted("Color / Intensity");
+    ImGui::TextDisabled("Color sets the RGB light color. Intensity controls the brightness of the selected light.");
+
+    ImGui::TextUnformatted("Radius");
+    ImGui::TextDisabled("Controls the maximum area reached by the light. Larger values illuminate a wider part of the scene.");
+
+    ImGui::TextUnformatted("Light Bulb Radius");
+    ImGui::TextDisabled("Controls the apparent size of the light source used by the light component.");
+
+    ImGui::TextUnformatted("Falloff Exponent / Quadratic Falloff");
+    ImGui::TextDisabled("Controls how quickly the light loses intensity with distance. Quadratic Falloff switches to the engine's inverse-square style falloff behaviour.");
+
+    ImGui::TextUnformatted("Position and Rotation");
+    ImGui::TextDisabled("X / Y / Z move the light. Spot lights also expose Pitch, Yaw and Roll to aim the light, plus Inner, Outer and Light Shaft cone angles.");
+
+    ImGui::TextUnformatted("Move to Camera");
+    ImGui::TextDisabled("Places the selected light at the current camera position and orientation for quick photo-light placement.");
+
+    ImGui::TextUnformatted("Apply / Reset");
+    ImGui::TextDisabled("Apply sends the edited values to the live light. Reset restores the values captured for that BatLit light.");
+
+    ImGui::TextWrapped("Shadow and other advanced lighting controls are intentionally hidden for now because they are not yet reliable in Arkham Knight.");
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextWrapped("Original game values are captured automatically when BAK Tweaks initializes. Reset buttons restore those captured session values.");
+}
+
+void ConfigureBAKTweaksStyle() {
+    ImGuiStyle& st = ImGui::GetStyle();
+    st.WindowRounding = 6.0f;
+    st.ChildRounding = 4.0f;
+    st.FrameRounding = 4.0f;
+    st.PopupRounding = 4.0f;
+    st.ScrollbarRounding = 6.0f;
+    st.GrabRounding = 4.0f;
+    st.TabRounding = 4.0f;
+    st.WindowBorderSize = 1.0f;
+    st.FrameBorderSize = 0.0f;
+    st.TabBorderSize = 0.0f;
+    st.ItemSpacing = ImVec2(8.0f, 6.0f);
+    st.FramePadding = ImVec2(8.0f, 5.0f);
+
+    ImVec4* c = st.Colors;
+    c[ImGuiCol_Text]                 = ImVec4(0.88f,0.88f,0.88f,1.00f);
+    c[ImGuiCol_TextDisabled]         = ImVec4(0.52f,0.52f,0.52f,1.00f);
+    c[ImGuiCol_WindowBg]             = ImVec4(0.025f,0.025f,0.025f,0.96f);
+    c[ImGuiCol_ChildBg]              = ImVec4(0.045f,0.045f,0.045f,0.82f);
+    c[ImGuiCol_PopupBg]              = ImVec4(0.035f,0.035f,0.035f,0.98f);
+    c[ImGuiCol_Border]               = ImVec4(0.33f,0.33f,0.33f,0.55f);
+    c[ImGuiCol_FrameBg]              = ImVec4(0.10f,0.10f,0.10f,0.95f);
+    c[ImGuiCol_FrameBgHovered]       = ImVec4(0.16f,0.16f,0.16f,1.00f);
+    c[ImGuiCol_FrameBgActive]        = ImVec4(0.21f,0.21f,0.21f,1.00f);
+    c[ImGuiCol_TitleBg]              = ImVec4(0.025f,0.025f,0.025f,1.00f);
+    c[ImGuiCol_TitleBgActive]        = ImVec4(0.055f,0.055f,0.055f,1.00f);
+    c[ImGuiCol_MenuBarBg]            = ImVec4(0.05f,0.05f,0.05f,1.00f);
+    c[ImGuiCol_ScrollbarBg]          = ImVec4(0.03f,0.03f,0.03f,0.80f);
+    c[ImGuiCol_ScrollbarGrab]        = ImVec4(0.22f,0.22f,0.22f,0.85f);
+    c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.30f,0.30f,0.30f,1.00f);
+    c[ImGuiCol_ScrollbarGrabActive]  = ImVec4(0.38f,0.38f,0.38f,1.00f);
+    c[ImGuiCol_CheckMark]            = ImVec4(0.86f,0.86f,0.86f,1.00f);
+    c[ImGuiCol_SliderGrab]           = ImVec4(0.45f,0.45f,0.45f,1.00f);
+    c[ImGuiCol_SliderGrabActive]     = ImVec4(0.62f,0.62f,0.62f,1.00f);
+    c[ImGuiCol_Button]               = ImVec4(0.12f,0.12f,0.12f,1.00f);
+    c[ImGuiCol_ButtonHovered]        = ImVec4(0.22f,0.22f,0.22f,1.00f);
+    c[ImGuiCol_ButtonActive]         = ImVec4(0.30f,0.30f,0.30f,1.00f);
+    c[ImGuiCol_Header]               = ImVec4(0.11f,0.11f,0.11f,0.92f);
+    c[ImGuiCol_HeaderHovered]        = ImVec4(0.20f,0.20f,0.20f,1.00f);
+    c[ImGuiCol_HeaderActive]         = ImVec4(0.28f,0.28f,0.28f,1.00f);
+    c[ImGuiCol_Separator]            = ImVec4(0.33f,0.33f,0.33f,0.42f);
+    c[ImGuiCol_SeparatorHovered]     = ImVec4(0.45f,0.45f,0.45f,0.70f);
+    c[ImGuiCol_SeparatorActive]      = ImVec4(0.58f,0.58f,0.58f,0.85f);
+    c[ImGuiCol_Tab]                  = ImVec4(0.08f,0.08f,0.08f,1.00f);
+    c[ImGuiCol_TabHovered]           = ImVec4(0.24f,0.24f,0.24f,1.00f);
+    c[ImGuiCol_TabSelected]          = ImVec4(0.33f,0.33f,0.33f,1.00f);
+    c[ImGuiCol_TabSelectedOverline]  = ImVec4(0.78f,0.78f,0.78f,1.00f);
+    c[ImGuiCol_TabDimmed]            = ImVec4(0.06f,0.06f,0.06f,1.00f);
+    c[ImGuiCol_TabDimmedSelected]    = ImVec4(0.18f,0.18f,0.18f,1.00f);
+}
+
+void ApplyUiScale() {
+    if (!g_baseStyleCaptured) return;
+    if (g_lastUiScale == g_uiScale) return;
+
+    ImGui::GetStyle() = g_baseStyle;
+    ImGui::GetStyle().ScaleAllSizes(g_uiScale);
+    ImGui::GetIO().FontGlobalScale = g_uiScale;
+    g_lastUiScale = g_uiScale;
+}
+
+void DrawUi() {
+    if (!g_uiOpen.load()) return;
+    ApplyUiScale();
+    ImGui::SetNextWindowSize(ImVec2(760.0f * g_uiScale, 650.0f * g_uiScale), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowBgAlpha(0.96f);
+    if (ImGui::Begin("BAK Tweaks", nullptr, ImGuiWindowFlags_NoCollapse)) {
+        {
+        const std::string toggleName = VirtualKeyName(g_hotkeyToggleUI);
+        ImGui::TextDisabled("%s - Show / Hide", toggleName.c_str());
+    }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(150.0f * g_uiScale);
+        ImGui::SliderFloat("UI Scale", &g_uiScaleDraft, 1.0f, 3.0f, "%.2fx");
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            g_uiScale = g_uiScaleDraft;
+            ApplyUiScale();
+        }
+        ImGui::SameLine(ImGui::GetWindowWidth() - (150.0f * g_uiScale));
+        if (ImGui::Button("Reset Global")) ResetGlobal();
+        ImGui::Separator();
+        if (ImGui::BeginTabBar("##BAKTweaksTabs", ImGuiTabBarFlags_FittingPolicyResizeDown)) {
+            if (ImGui::BeginTabItem("Cape")) { DrawCapeTab(); ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem("Environment")) { DrawEnvironmentTab(); ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem("BatLit")) { DrawBatLitTab(); ImGui::EndTabItem(); }
+
+        if (ImGui::BeginTabItem("About"))
+        {
+            DrawAboutTab();
+            ImGui::EndTabItem();
+        }
+
+            ImGui::EndTabBar();
+        }
+    }
+    ImGui::End();
+    DrawBatLitEditors();
+}
+
+HRESULT __stdcall HookPresent(IDXGISwapChain* swap, UINT syncInterval, UINT flags) {
+    if (!g_presentSeen.exchange(true)) Log(L"HookPresent: first in-game Present hit");
+
+    // The configured UI-toggle shortcut has a single owner: async polling in Present.
+    // This is intentionally independent of the game's WndProc/raw-input path,
+    // which is not reliable for this shortcut in Arkham Knight and can change after a
+    // resolution/fullscreen switch.
+    static bool f10WasDown = false;
+    const bool f10Down = (GetAsyncKeyState(g_hotkeyToggleUI) & 0x8000) != 0;
+    if (g_hotkeyCaptureTarget == 0 && f10Down && !f10WasDown) {
+        const bool wasOpen = g_uiOpen.load();
+        const bool nowOpen = !wasOpen;
+        g_uiOpen.store(nowOpen);
+
+        if (!nowOpen) {
+            // Win32/API hooks stop filtering immediately because g_uiOpen is now false.
+            // UE3 ProcessEvent calls must stay on the game thread, so request a hard
+            // IgnoreMove/Look/Button(false) + ResetPlayerMovementInput on the next tick.
+            BatLitNative::g_forceInputRelease.store(true);
+            ReleaseCapture();
+        }
+
+        if (g_imguiReady) MaintainUiInputCapture();
+        Log(nowOpen ? L"Shortcut: UI opened" : L"Shortcut: UI closed - input release requested");
+    }
+    f10WasDown = f10Down;
+
+    // Lightning shortcuts remain available while the interface is hidden.
+    // F6 = Small Lightning, F7 = Vertical / Big Lightning.
+    // They use the exact values currently configured in the Lightning panel.
+    static bool f6WasDown = false;
+    static bool f7WasDown = false;
+
+    const bool uiClosed = !g_uiOpen.load();
+    const bool rebindingHotkey = (g_hotkeyCaptureTarget != 0);
+    const bool f6Down = (GetAsyncKeyState(g_hotkeySmallLightning) & 0x8000) != 0;
+    const bool f7Down = (GetAsyncKeyState(g_hotkeyVerticalLightning) & 0x8000) != 0;
+
+    if (!rebindingHotkey && uiClosed && f6Down && !f6WasDown) {
+        BatLitNative::QueueLightningTrigger(
+            false,
+            BatLitNative::g_smallLightningDuration,
+            BatLitNative::g_smallLightningDistance,
+            BatLitNative::g_smallLightningInstances,
+            BatLitNative::g_smallLightningSalvoCount,
+            BatLitNative::g_smallLightningSalvoInterval,
+            BatLitNative::g_smallLightningClusters,
+            BatLitNative::g_smallLightningClusterSpread,
+            BatLitNative::g_lightningRandomizePosition,
+            BatLitNative::g_lightningSpreadX,
+            BatLitNative::g_lightningSpreadY,
+            BatLitNative::g_lightningDistanceJitter);
+        Log(L"Shortcut: Small Lightning triggered");
+    }
+
+    if (!rebindingHotkey && uiClosed && f7Down && !f7WasDown) {
+        BatLitNative::QueueLightningTrigger(
+            true,
+            BatLitNative::g_verticalLightningDuration,
+            BatLitNative::g_verticalLightningDistance,
+            BatLitNative::g_verticalLightningInstances,
+            BatLitNative::g_verticalLightningSalvoCount,
+            BatLitNative::g_verticalLightningSalvoInterval,
+            BatLitNative::g_verticalLightningClusters,
+            BatLitNative::g_verticalLightningClusterSpread,
+            BatLitNative::g_lightningRandomizePosition,
+            BatLitNative::g_lightningSpreadX,
+            BatLitNative::g_lightningSpreadY,
+            BatLitNative::g_lightningDistanceJitter);
+        Log(L"Shortcut: Vertical Lightning triggered");
+    }
+
+    f6WasDown = f6Down;
+    f7WasDown = f7Down;
+
+    if (!g_imguiReady) {
+        if (SUCCEEDED(swap->GetDevice(IID_PPV_ARGS(&g_device)))) {
+            g_device->GetImmediateContext(&g_context);
+            DXGI_SWAP_CHAIN_DESC desc{};
+            swap->GetDesc(&desc);
+            g_hwnd = desc.OutputWindow;
+            CreateRenderTarget(swap);
+            ImGui::CreateContext();
+            ImGuiIO& io = ImGui::GetIO();
+            io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+            ImGui::StyleColorsDark();
+            ConfigureBAKTweaksStyle();
+            g_baseStyle = ImGui::GetStyle();
+            g_baseStyleCaptured = true;
+            ApplyUiScale();
+            ImGui_ImplWin32_Init(g_hwnd);
+            ImGui_ImplDX11_Init(g_device, g_context);
+            g_originalWndProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(HookWndProc)));
+            CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            g_imguiReady = true;
+            MaintainUiInputCapture();
+            Log(L"BAK Tweaks v5.24 ANY KEY HOTKEYS loaded");
+            Log(L"ImGui initialized on game swap chain");
+        }
+    }
+
+    if (g_imguiReady) {
+        // Do not build/render an ImGui frame while the interface is hidden unless
+        // the user explicitly wants the light gizmo visible in-game.
+        const bool needOverlayFrame =
+            g_uiOpen.load() || HasVisibleLightGizmos();
+
+        if (needOverlayFrame) {
+            if (g_uiOpen.load()) MaintainUiInputCapture();
+
+            ImGui_ImplDX11_NewFrame();
+            ImGui_ImplWin32_NewFrame();
+            ImGui::NewFrame();
+
+            DrawUi();
+            DrawLightGizmos();
+
+            ImGui::Render();
+            if (g_rtv) {
+                g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
+                ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+            }
+
+            if (g_uiOpen.load()) MaintainUiInputCapture();
+        }
+    }
+    return g_originalPresent(swap, syncInterval, flags);
+}
+
+
+HRESULT __stdcall HookResizeBuffers(IDXGISwapChain* swap, UINT bufferCount, UINT width, UINT height, DXGI_FORMAT newFormat, UINT swapChainFlags) {
+    if (g_imguiReady && g_context) {
+        g_context->OMSetRenderTargets(0, nullptr, nullptr);
+        ImGui_ImplDX11_InvalidateDeviceObjects();
+    }
+    if (g_rtv) {
+        g_rtv->Release();
+        g_rtv = nullptr;
+    }
+
+    const HRESULT hr = g_originalResizeBuffers(swap, bufferCount, width, height, newFormat, swapChainFlags);
+    if (SUCCEEDED(hr) && g_imguiReady && g_device) {
+        CreateRenderTarget(swap);
+        ImGui_ImplDX11_CreateDeviceObjects();
+        RebindGameWindowAfterResize(swap);
+    }
+    return hr;
+}
+
+bool HookD3D11Present() {
+    Log(L"HookD3D11Present: starting");
+    // Hidden helper HWND used only once to discover the D3D11 swap-chain vtable.
+    // It is never shown. The actual UI is rendered inside BatmanAK.exe Present().
+    WNDCLASSEXW wc{sizeof(wc), CS_CLASSDC, DefWindowProcW, 0, 0, GetModuleHandleW(nullptr), nullptr, nullptr, nullptr, nullptr, L"BAKTweaksHiddenD3D11Probe", nullptr};
+    RegisterClassExW(&wc);
+    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, wc.lpszClassName, L"", WS_POPUP, -32000, -32000, 2, 2, nullptr, nullptr, wc.hInstance, nullptr);
+    if (!hwnd) return false;
+
+    DXGI_SWAP_CHAIN_DESC sd{};
+    sd.BufferCount = 1; sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.OutputWindow = hwnd; sd.SampleDesc.Count = 1; sd.Windowed = TRUE; sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    D3D_FEATURE_LEVEL level{};
+    ID3D11Device* dev = nullptr; ID3D11DeviceContext* ctx = nullptr; IDXGISwapChain* sc = nullptr;
+    HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &sd, &sc, &dev, &level, &ctx);
+    if (FAILED(hr)) hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &sd, &sc, &dev, &level, &ctx);
+    bool ok = false;
+    if (SUCCEEDED(hr) && sc) {
+        void** vtbl = *reinterpret_cast<void***>(sc);
+        const MH_STATUS initStatus = MH_Initialize();
+        if (initStatus == MH_OK || initStatus == MH_ERROR_ALREADY_INITIALIZED) {
+            const MH_STATUS presentStatus = MH_CreateHook(vtbl[8], &HookPresent, reinterpret_cast<void**>(&g_originalPresent));
+            const MH_STATUS resizeStatus  = MH_CreateHook(vtbl[13], &HookResizeBuffers, reinterpret_cast<void**>(&g_originalResizeBuffers));
+            const bool presentCreated = (presentStatus == MH_OK || presentStatus == MH_ERROR_ALREADY_CREATED);
+            const bool resizeCreated  = (resizeStatus == MH_OK || resizeStatus == MH_ERROR_ALREADY_CREATED);
+            if (presentCreated && resizeCreated && MH_EnableHook(MH_ALL_HOOKS) == MH_OK) { ok = true; Log(L"D3D11 hooks enabled"); }
+        }
+    }
+    if (ctx) ctx->Release(); if (dev) dev->Release(); if (sc) sc->Release();
+    DestroyWindow(hwnd); UnregisterClassW(wc.lpszClassName, wc.hInstance);
+    Log(ok ? L"HookD3D11Present: success" : L"HookD3D11Present: FAILED");
+    return ok;
+}
+
+DWORD WINAPI WorkerThread(void*) {
+    ResetSessionLog();
+    LoadHotkeyConfig();
+    Log(L"BAK Tweaks worker started");
+    InstallHardInputBlockHooks();
+    InstallCapeResolverHook();
+    Log(L"Cape resolver hook attempted");
+    if (BatLitNative::Init() && BatLitNative::HookTick()) Log(L"BatLit SAFE: game-thread hook enabled");
+    else Log(L"BatLit SAFE: game-thread hook FAILED");
+    HookD3D11Present();
+    DWORD lastEnvRefresh = 0;
+    DWORD lastWeatherParticleRefresh = 0;
+    while (g_running.load()) {
+        CaptureCapeDefaults();
+        const DWORD now = GetTickCount();
+        if (now - lastWeatherParticleRefresh >= 1000) {
+            RefreshWeatherParticleComponentsFast();
+            lastWeatherParticleRefresh = now;
+        }
+        if (now - lastEnvRefresh >= 5000) {
+            RefreshLocationDependentParticles();
+            lastEnvRefresh = now;
+        }
+        Sleep(50);
+    }
+    return 0;
+}
+
+} // namespace
+
+extern "C" __declspec(dllexport) uintptr_t __stdcall BAKTweaks_GetCapeBase() { return g_capeBase.load(); }
+extern "C" __declspec(dllexport) uintptr_t __stdcall BAKTweaks_GetRainEngineAddress() { return g_rainEngine.load(); }
+extern "C" __declspec(dllexport) uintptr_t __stdcall BAKTweaks_GetRainConsoleAddress() { return 0; }
+extern "C" __declspec(dllexport) void __stdcall BAKTweaks_ResetCape() { ResetCape(); }
+extern "C" __declspec(dllexport) void __stdcall BAKTweaks_ResetRain() { ResetRain(); }
+extern "C" __declspec(dllexport) void __stdcall BAKTweaks_ResetGlobal() { ResetGlobal(); }
+
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        g_module = module;
+        DisableThreadLibraryCalls(module);
+        HANDLE h = CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
+        if (h) CloseHandle(h);
+    }
+    return TRUE;
+}

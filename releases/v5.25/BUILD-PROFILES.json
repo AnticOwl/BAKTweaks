@@ -1,0 +1,76 @@
+{
+  "version": "5.25",
+  "originalDLL": {
+    "sha256": "2d26fb1aef9616ad2e28fba9ce3505ba711bcd5222c55d44594d35c00073896c",
+    "bytes": 742912
+  },
+  "builds": [
+    {
+      "edition": "Steam",
+      "path": "D:/SteamLibrary/steamapps/common/Batman Arkham Knight/Binaries/Win64/BatmanAK.exe",
+      "bytes": 54632960,
+      "sha256": "2684b84dec2c31e5a00bff070b00ae41d4fed4fc4bade51e0d5bc64bfe1b83db",
+      "timestamp": "0x5f8aa2f9",
+      "sizeOfImage": "0x4398000",
+      "functions": {
+        "find": "0xf3b7f0",
+        "event": "0xf90cd0",
+        "spawn": "0xacbc70",
+        "default": "0xf92870",
+        "tick": "0x5b1da0",
+        "exposure": "0x9f3779"
+      },
+      "objects": "0x340cbe4",
+      "objectCount": "0x3a09f28"
+    },
+    {
+      "edition": "Epic",
+      "path": "E:/Games/BatmanArkhamKnight/Binaries/Win64/BatmanAK.exe",
+      "bytes": 55101440,
+      "sha256": "4b81c4cd410e016223894985c3beecaf7c64d26a8ce805ce340b1c0b7101490a",
+      "timestamp": "0x6508b1ce",
+      "sizeOfImage": "0x440b000",
+      "functions": {
+        "find": "0xf66230",
+        "event": "0xfbbcc0",
+        "spawn": "0xaf45a0",
+        "default": "0xfbd860",
+        "tick": "0x5d9850",
+        "exposure": "0xa1c499"
+      },
+      "objects": "0x347aca4",
+      "objectCount": "0x3a77fe8"
+    }
+  ],
+  "binaryChecks": {
+    "normalizedDisassembly": {
+      "find": 265,
+      "event": 193,
+      "spawn": 425,
+      "default": 19,
+      "tick": 385
+    },
+    "globalReferences": {
+      "objects": 78,
+      "objectCount": 166
+    }
+  },
+  "newDLL": {
+    "sha256": "31f61f73745edd1abaf0b73c465544a140bafb4185f48ae63768921868697698",
+    "bytes": 2214912
+  },
+  "runtimeValidation": {
+    "steam": {
+      "loaded": true,
+      "engineResolver": true,
+      "lightPropertyLayout": true,
+      "titleVersionVisible": true,
+      "livePaused": "Native Point/Spot transforms tested under IGCS pause; user confirmed live light/gizmo movement in Steam. Session log identifies Spot1. Individual controls not exhaustively validated."
+    },
+    "epic": "pending"
+  },
+  "limitations": [
+    "Epic fixed Steam particle-object indices are disabled; lightning module resolution is not validated for Epic.",
+    "Passive editor trace expired before manual edits; earlier reported failure was not reproduced. Intensity and all individual axes remain unverified; Epic runtime remains pending."
+  ]
+}
